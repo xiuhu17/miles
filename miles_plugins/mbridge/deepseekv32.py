@@ -1,5 +1,6 @@
 from mbridge.core import register_model
 from mbridge.models import DeepseekV3Bridge
+from megatron.core.transformer.enums import AttnBackend
 
 
 @register_model("deepseek_v32")
@@ -41,6 +42,8 @@ class DeepseekV32Bridge(DeepseekV3Bridge):
 
     def _build_config(self):
         config = super()._build_config()
+        
+        config.attention_backend = AttnBackend.auto
         
         config.experimental_attention_variant = "dsa"
         config.dsa_indexer_n_heads = getattr(self.hf_config, 'dsa_indexer_n_heads', 64)

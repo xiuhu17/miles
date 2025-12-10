@@ -13,8 +13,8 @@ app = typer.Typer()
 class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = U.create_run_id()
     hf_checkpoint: str = "/root/.cache/dsv32-ckpt/DeepSeek-V3.2-5layer"
-    torch_dist_checkpoint: str = "/root/.cache/dsv32-ckpt/DeepSeek-V3-0324-5layer_torch_dist"
-    num_gpus_per_node: int = 8
+    torch_dist_checkpoint: str = "/root/DeepSeek-V3.2-5layer_torch_dist"
+    num_gpus_per_node: int = 4
     enable_eval: bool = False
     enable_deepep: bool = False
     extra_args: str = ""
@@ -87,8 +87,8 @@ def train(args: ScriptArgs):
             "--tensor-model-parallel-size 1 "
             "--sequence-parallel "
             "--pipeline-model-parallel-size 1 "
-            "--context-parallel-size 8 "
-            "--expert-model-parallel-size 8 "
+            "--context-parallel-size 1 "
+            "--expert-model-parallel-size 4 "
             "--expert-tensor-parallel-size 1 "
         )
     elif args.num_nodes <= 4:
@@ -136,7 +136,7 @@ def train(args: ScriptArgs):
     )
 
     sglang_decode_max_bs = 256
-    sglang_world_size = 8 if args.num_nodes <= 4 else 64
+    sglang_world_size = 4 if args.num_nodes <= 4 else 64
     sglang_attn_dp_size = 1 if args.num_nodes <= 4 else 8
     sglang_attn_tp_size = sglang_world_size // sglang_attn_dp_size
     sglang_args = (
@@ -168,6 +168,7 @@ def train(args: ScriptArgs):
         "--hidden-dropout 0.0 "
         "--accumulate-allreduce-grads-in-fp32 "
         "--attention-softmax-in-fp32 "
+        "--attention-backend auto "
         f"--update-weight-buffer-size {4 * 1024 ** 3} "
         f"--actor-num-nodes {args.num_nodes} "
         f"--actor-num-gpus-per-node {args.num_gpus_per_node} "
@@ -176,6 +177,7 @@ def train(args: ScriptArgs):
         "--use-fault-tolerance "
         f"--dump-details /root/shared_data/{args.run_id}/dump_details "
         "--disable-weights-backuper "
+        "--model-name deepseekv32 "
     )
 
     train_args = (
