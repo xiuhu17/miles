@@ -38,7 +38,6 @@ def train(args):
         ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
 
     # always update weight first so that sglang has the loaded weights from training.
-    print("[DEBUG] train.py first update weights")
     actor_model.update_weights()
 
     if args.check_weight_update_equal:

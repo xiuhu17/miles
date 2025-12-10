@@ -5,7 +5,7 @@ import torch
 from packaging.version import parse
 
 
-def convert_deepseekv3_2_to_hf(args, name, param):
+def convert_deepseekv32_to_hf(args, name, param):
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":
@@ -77,7 +77,7 @@ def convert_deepseekv3_2_to_hf(args, name, param):
             return [(f"model.layers.{layer_idx}.self_attn.q_proj.weight", param)]
         elif rest == "self_attention.linear_q_down_proj.weight":
             return [(f"model.layers.{layer_idx}.self_attn.q_a_proj.weight", param)]
-        elif rest == "self_attention.linear_q_up_proj.layer_norm_weight":
+        elif rest == "self_attention.q_layernorm.weight":
             return [(f"model.layers.{layer_idx}.self_attn.q_a_layernorm.weight", param)]
         elif rest == "self_attention.linear_q_up_proj.weight":
             return [(f"model.layers.{layer_idx}.self_attn.q_b_proj.weight", param)]
@@ -110,12 +110,23 @@ def convert_deepseekv3_2_to_hf(args, name, param):
             return [(f"model.layers.{layer_idx}.post_attention_layernorm.weight", param)]
         elif rest == "self_attention.linear_kv_down_proj.weight":
             return [(f"model.layers.{layer_idx}.self_attn.kv_a_proj_with_mqa.weight", param)]
-        elif rest == "self_attention.linear_kv_up_proj.layer_norm_weight":
+        elif rest == "self_attention.kv_layernorm.weight":
             return [(f"model.layers.{layer_idx}.self_attn.kv_a_layernorm.weight", param)]
         elif rest == "self_attention.linear_kv_up_proj.weight":
             return [(f"model.layers.{layer_idx}.self_attn.kv_b_proj.weight", param)]
         elif rest == "pre_mlp_layernorm.weight":
             return [(f"model.layers.{layer_idx}.post_attention_layernorm.weight", param)]
+        # DSA Indexer parameters
+        elif rest == "self_attention.core_attention.indexer.linear_wq_b.weight":
+            return [(f"model.layers.{layer_idx}.self_attn.indexer.wq_b.weight", param)]
+        elif rest == "self_attention.core_attention.indexer.linear_wk.weight":
+            return [(f"model.layers.{layer_idx}.self_attn.indexer.wk.weight", param)]
+        elif rest == "self_attention.core_attention.indexer.k_norm.weight":
+            return [(f"model.layers.{layer_idx}.self_attn.indexer.k_norm.weight", param)]
+        elif rest == "self_attention.core_attention.indexer.k_norm.bias":
+            return [(f"model.layers.{layer_idx}.self_attn.indexer.k_norm.bias", param)]
+        elif rest == "self_attention.core_attention.indexer.linear_weights_proj.weight":
+            return [(f"model.layers.{layer_idx}.self_attn.indexer.weights_proj.weight", param)]
         elif rest == "mlp.router.weight":
             return [(f"model.layers.{layer_idx}.mlp.gate.weight", param)]
         elif rest == "mlp.router.expert_bias":

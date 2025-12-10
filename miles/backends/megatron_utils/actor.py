@@ -12,6 +12,9 @@ from ray.actor import ActorHandle
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
 
+from miles.utils.deepseek_v32_patch import apply_deepseek_v32_patch
+apply_deepseek_v32_patch()
+
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import train_dump_utils
 from miles.utils.context_utils import with_defer
