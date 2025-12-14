@@ -61,6 +61,10 @@ RUN git clone https://github.com/NVIDIA/Megatron-LM.git --recursive && \
     cd Megatron-LM && git checkout ${MEGATRON_COMMIT} && \
     pip install -e .
 
+RUN git clone https://github.com/huggingface/transformers.git && \
+    cd transformers && git checkout 40dc11cd3eb4126652aa41ef8272525affd4a636 && \
+    pip install -e .
+
 RUN pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@dc6876905830430b5054325fa4211ff302169c6b --no-cache-dir --force-reinstall
 RUN pip install git+https://github.com/fzyzcjy/Megatron-Bridge.git@dev_rl --no-build-isolation
 RUN pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation
@@ -102,7 +106,7 @@ RUN [ ! -f /root/.tmux.conf ] || rm /root/.tmux.conf
 
 # ====================================== Patches ============================================
 
-COPY docker/deepseekv32/${PATCH_VERSION}/megatron_dsv32.patch /root/Megatron-LM/
+COPY docker/deepseekv32/megatron.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     git update-index --refresh && \
     git apply megatron.patch --3way && \
@@ -111,6 +115,16 @@ RUN cd Megatron-LM && \
       exit 1; \
     fi && \
     rm megatron.patch
+
+COPY docker/deepseekv32/transformers.patch /root/transformers/
+RUN cd transformers && \
+    git update-index --refresh && \
+    git apply transformers.patch --3way && \
+    if grep -R -n '^<<<<<<< ' .; then \
+      echo "Patch failed to apply cleanly. Please resolve conflicts." && \
+      exit 1; \
+    fi && \
+    rm transformers.patch
 
 # TODO temporarily skip patching for GB200/GB300 (and require users to bring their own sglang version). should add back later.
 COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
