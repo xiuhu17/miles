@@ -2,9 +2,6 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from miles.utils.deepseek_v32_patch import apply_deepseek_v32_patch
-apply_deepseek_v32_patch(restore_model_type=True)
-
 from .deepseekv32 import DeepseekV32Bridge
 from .glm4 import GLM4Bridge
 from .glm4moe import GLM4MoEBridge
