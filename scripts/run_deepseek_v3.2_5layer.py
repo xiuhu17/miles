@@ -19,7 +19,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     enable_deepep: bool = False
     extra_args: str = ""
     task: Literal["dapo_aime", "gsm8k"] = "dapo_aime"
-    mode: Literal["normal", "debug_minimal"] = "debug_minimal"
+    mode: Literal["normal", "debug_minimal"] = "normal"
 
 
 @app.command()
@@ -63,7 +63,7 @@ def train(args: ScriptArgs):
             rollout_args += (
                 "--prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl "
                 "--input-key prompt "
-                f"--rollout-max-response-len {100 if args.mode == 'debug_minimal' else 32768} "
+                f"--rollout-max-response-len {100 if args.mode == 'debug_minimal' else 8192} "
             )
             eval_args += (
                 "--eval-prompt-data aime /root/aime-2024/aime-2024.jsonl "
@@ -87,8 +87,8 @@ def train(args: ScriptArgs):
             "--tensor-model-parallel-size 1 "
             "--sequence-parallel "
             "--pipeline-model-parallel-size 1 "
-            "--context-parallel-size 1 "
-            "--expert-model-parallel-size 4 "
+            "--context-parallel-size 8 "
+            f"--expert-model-parallel-size {args.num_gpus_per_node} "
             "--expert-tensor-parallel-size 1 "
         )
     elif args.num_nodes <= 4:
@@ -136,7 +136,7 @@ def train(args: ScriptArgs):
     )
 
     sglang_decode_max_bs = 256
-    sglang_world_size = 4 if args.num_nodes <= 4 else 64
+    sglang_world_size = args.num_gpus_per_node if args.num_nodes <= 4 else 64
     sglang_attn_dp_size = 1 if args.num_nodes <= 4 else 8
     sglang_attn_tp_size = sglang_world_size // sglang_attn_dp_size
     sglang_args = (
@@ -178,6 +178,7 @@ def train(args: ScriptArgs):
         f"--dump-details /root/shared_data/{args.run_id}/dump_details "
         "--disable-weights-backuper "
         "--model-name deepseekv32 "
+        "--train-memory-margin-bytes 1073741824 "
     )
 
     train_args = (
@@ -195,7 +196,7 @@ def train(args: ScriptArgs):
 
     U.execute_train(
         train_args=train_args,
-        train_script="scripts/train_dsv32.py",
+        train_script="train.py",
         config=args,
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type="deepseek-v32-5layer",
