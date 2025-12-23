@@ -62,17 +62,16 @@ def get_batch(
     batch["unconcat_tokens"] = tokens
 
     cp_size = mpu.get_context_parallel_world_size()
-    
-    if qkv_format == "bshd":
-        max_seqlen = max([t.size(0) for t in tokens])
-        tokens = [slice_with_cp(t, pad_token_id, format, max_seqlen) for t in tokens]
-        tokens = torch.stack(tokens) 
-        pad = (pad_size - tokens.size(1) % pad_size) % pad_size
-        if pad != 0:
-            tokens = F.pad(tokens, (0, 0, 0, pad), value=pad_token_id)
 
+    if qkv_format == "bshd":
+        max_seqlen = batch["max_seq_len"][0]
+        assert max([t.size(0) for t in tokens]) <= max_seqlen
+        tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
+        tokens = torch.stack(tokens) 
+        # TODO: padding to multiples?
+        
     elif qkv_format == "thd":
-        tokens = [slice_with_cp(t, pad_token_id, format) for t in tokens]
+        tokens = [slice_with_cp(t, pad_token_id, qkv_format) for t in tokens]
 
         cu_seqlens = [0]
         for t in tokens:
@@ -325,6 +324,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
+        max_seq_len = rollout_data.get("max_seq_len", None)
 
         for key, val in rollout_data.items():
             if key in [
@@ -332,6 +332,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "loss_masks",
                 "sample_indices",
                 "rollout_routed_experts",
+                "max_seq_len",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -343,7 +344,13 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                     # modified in place and will cause problem for the next rollout.
                     val = torch.cat(val).clone().detach()
                     if key in ["log_probs", "ref_log_probs", "rollout_log_probs", "returns", "advantages", "values"]:
-                        sum_of_sample_mean = get_sum_of_sample_mean(total_lengths, response_lengths, loss_masks)
+                        sum_of_sample_mean = get_sum_of_sample_mean(
+                            total_lengths,
+                            response_lengths,
+                            loss_masks,
+                            qkv_format=args.qkv_format,
+                            max_seq_len=max_seq_len
+                        )
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
                         val = val.mean() * cp_size

@@ -192,19 +192,24 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_data["loss_masks"] = [
             torch.tensor(t, dtype=torch.int, device=torch.cuda.current_device()) for t in rollout_data["loss_masks"]
         ]
+
+        if self.args.qkv_format == "bshd": # TODO: micro-batch wise dynamic, possibly move to @data.py:get_data_iterator
+            rollout_data["max_seq_len"] = [max(rollout_data["total_lengths"])] * len(rollout_data["tokens"]) 
+        
         if "rollout_log_probs" in rollout_data:
             rollout_data["rollout_log_probs"] = [
                 torch.tensor(
-                    slice_log_prob_with_cp(log_prob, total_length, response_length),
+                    slice_log_prob_with_cp(log_prob, total_length, response_length, self.args.qkv_format,
+                                            rollout_data["max_seq_len"][i] if self.args.qkv_format == "bshd" else None,),
                     device=torch.cuda.current_device(),
                     dtype=torch.float32,
                 )
-                for log_prob, total_length, response_length in zip(
+                for i, (log_prob, total_length, response_length) in enumerate(zip(
                     rollout_data["rollout_log_probs"],
                     rollout_data["total_lengths"],
                     rollout_data["response_lengths"],
                     strict=False,
-                )
+                ))
             ]
         if "rollout_routed_experts" in rollout_data:
             rollout_data["rollout_routed_experts"] = [
