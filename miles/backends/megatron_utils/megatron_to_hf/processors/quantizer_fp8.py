@@ -73,6 +73,9 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
         "self_attention.linear_q_up_proj.weight",
         "self_attention.linear_kv_down_proj.weight",
         "self_attention.linear_kv_up_proj.weight",
+        # dsa indexer
+        "self_attention.core_attention.indexer.linear_wq_b.weight",
+        "self_attention.core_attention.indexer.linear_wk.weight",
     ]:
         quantize_named_params = []
         for converted_name, param in converted_named_params:
