@@ -87,7 +87,7 @@ def get_responses(
             tokens_chunk = tokens[-response_length:]
         else:
             # TODO: this is super ugly... do better abstraction.
-            _max_seq_len = max_seq_len[i] if max_seq_len is not None else None
+            max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
             chunk_size, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
                 total_length, response_length, parallel_state, qkv_format, max_seq_len
             )
