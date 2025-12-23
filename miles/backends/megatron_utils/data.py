@@ -61,7 +61,7 @@ def get_batch(
     cp_size = mpu.get_context_parallel_world_size()
 
     if qkv_format == "bshd":
-        max_seqlen = batch["max_seq_len"][0]
+        max_seqlen = batch["max_seq_lens"][0]
         assert max([t.size(0) for t in tokens]) <= max_seqlen
         tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
         tokens = torch.stack(tokens)
@@ -96,7 +96,7 @@ def get_batch(
 
         tokens = tokens.unsqueeze(0)
     else:
-        raise ValueError(f"Unsupported format: {format}")
+        raise ValueError(f"Unsupported qkv_format: {qkv_format}")
 
     batch["tokens"] = tokens
     batch["packed_seq_params"] = packed_seq_params
@@ -321,7 +321,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
-        max_seq_len = rollout_data.get("max_seq_len", None)
+        max_seq_lens = rollout_data.get("max_seq_lens", None)
 
         for key, val in rollout_data.items():
             if key in [
@@ -329,7 +329,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "loss_masks",
                 "sample_indices",
                 "rollout_routed_experts",
-                "max_seq_len",
+                "max_seq_lens",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -346,7 +346,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                             response_lengths,
                             loss_masks,
                             qkv_format=args.qkv_format,
-                            max_seq_len=max_seq_len,
+                            max_seq_lens=max_seq_lens,
                         )
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:

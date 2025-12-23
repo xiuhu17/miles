@@ -31,7 +31,7 @@ def get_responses(
     unconcat_tokens: list[torch.Tensor],
     total_lengths: list[int],
     response_lengths: list[int],
-    max_seq_len: list[int] | None = None,
+    max_seq_lens: list[int] | None = None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample.
 
@@ -63,12 +63,12 @@ def get_responses(
         assert logits.size(0) == 1, f"{logits.shape}"
         logits = logits.squeeze(0)
     else:
-        assert max_seq_len is not None
+        assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
 
     logits = logits.div(args.rollout_temperature)
 
-    cp_size = mpu.get_context_parallel_world_size
+    cp_size = mpu.get_context_parallel_world_size()
     end = 0
     for i, (tokens, total_length, response_length) in enumerate(
         zip(unconcat_tokens, total_lengths, response_lengths, strict=False)
@@ -84,9 +84,9 @@ def get_responses(
                 tokens_chunk = tokens[-response_length:]
         else:
             # TODO: this is super ugly... do better abstraction.
-            _max_seq_len = max_seq_len[i] if max_seq_len is not None else None
+            max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
             chunk_size, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length, qkv_format, _max_seq_len
+                total_length, response_length, qkv_format, max_seq_len
             )
 
             logits_0, logits_1 = logits[end : end + chunk_size], logits[end + chunk_size : end + 2 * chunk_size]
@@ -116,7 +116,7 @@ def get_log_probs_and_entropy(
     response_lengths: list[int],
     with_entropy: bool = False,
     non_loss_data: bool = True,
-    max_seq_len: list[int] | None = None,
+    max_seq_lens: list[int] | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Compute per-token log-probabilities (and optionally entropy) on responses.
 
@@ -149,7 +149,7 @@ def get_log_probs_and_entropy(
         unconcat_tokens=unconcat_tokens,
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        max_seq_len=max_seq_len,
+        max_seq_lens=max_seq_lens,
     ):
         log_prob, entropy = calculate_log_probs_and_entropy(
             logits_chunk, tokens_chunk, mpu.get_tensor_model_parallel_group(), with_entropy=with_entropy
@@ -175,7 +175,7 @@ def get_values(
     response_lengths: list[int],
     with_entropy: bool = False,
     non_loss_data: bool = True,
-    max_seq_len: list[int] | None = None,
+    max_seq_lens: list[int] | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Extract per-token value predictions over response tokens.
 
@@ -203,7 +203,7 @@ def get_values(
         unconcat_tokens=unconcat_tokens,
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        max_seq_len=max_seq_len,
+        max_seq_lens=max_seq_lens,
     ):
         assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
         value_list.append(logits_chunk.squeeze(-1))
@@ -241,7 +241,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     response_lengths: list[int] = rollout_data.get("response_lengths")
     loss_masks: list[torch.Tensor] = rollout_data.get("loss_masks")
     total_lengths: list[int] = rollout_data.get("total_lengths")
-    max_seq_len: list[int] | None = rollout_data.get("max_seq_len", None)
+    max_seq_lens: list[int] | None = rollout_data.get("max_seq_lens", None)
 
     # return when not the last pp stage.
     if log_probs is None and values is None:
@@ -335,7 +335,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
                 total_len = total_lengths[i]
                 response_len = response_lengths[i]
                 prompt_len = total_len - response_len
-                max_seq_len = max_seq_len[i] if max_seq_len is not None else None
+                max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
 
                 _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(
                     total_len, response_len, args.qkv_format, max_seq_len
@@ -468,7 +468,7 @@ def policy_loss_function(
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
-    max_seq_len = batch.get("max_seq_len", None)
+    max_seq_lens = batch.get("max_seq_lens", None)
 
     log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -477,7 +477,7 @@ def policy_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=True,
-        max_seq_len=max_seq_len,
+        max_seq_lens=max_seq_lens,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -560,7 +560,7 @@ def policy_loss_function(
             modified_response_masks,
             args.calculate_per_token_loss,
             args.qkv_format,
-            batch.get("max_seq_len", None),
+            batch.get("max_seq_lens", None),
         )
 
     pg_loss = sum_of_sample_mean(pg_loss)
@@ -657,7 +657,7 @@ def value_loss_function(
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=batch["total_lengths"],
         response_lengths=batch["response_lengths"],
-        max_seq_len=batch.get("max_seq_len", None),
+        max_seq_lens=batch.get("max_seq_lens", None),
     )
     values = torch.cat([value.flatten() for value in values["values"]], dim=0)
 
@@ -716,7 +716,7 @@ def sft_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=False,
-        max_seq_len=batch.get("max_seq_len", None),
+        max_seq_lens=batch.get("max_seq_lens", None),
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -773,7 +773,7 @@ def loss_function(
         batch["loss_masks"],
         args.calculate_per_token_loss,
         args.qkv_format,
-        batch.get("max_seq_len", None),
+        batch.get("max_seq_lens", None),
     )
 
     match args.loss_type:

@@ -23,7 +23,7 @@ def get_logits_and_tokens_offset_with_cp(
     if qkv_format == "thd":
         chunk_size = (total_length + 2 * cp_size - 1) // (2 * cp_size)
     else:
-        assert max_seq_len is not None, "max_seq_len must be provided for bshd qkv format"
+        assert max_seq_len is not None, "max_seq_len must be provided for qkv_format=bshd"
         chunk_size = (max_seq_len + 2 * cp_size - 1) // (2 * cp_size)
 
     # the offset of 2 chunks
@@ -56,7 +56,7 @@ def get_sum_of_sample_mean(
     loss_masks: list[torch.Tensor],
     calculate_per_token_loss: bool = False,
     qkv_format: str = "thd",
-    max_seq_len: list[int] | None = None,
+    max_seq_lens: list[int] | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
     Calculate correct sample mean for CP
@@ -86,10 +86,10 @@ def get_sum_of_sample_mean(
         for i, (total_length, response_length, loss_mask) in enumerate(
             zip(total_lengths, response_lengths, loss_masks, strict=False)
         ):
-            _max_seq_len = max_seq_len[i] if max_seq_len is not None else None
+            max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
             prompt_length = total_length - response_length
             _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length, qkv_format, _max_seq_len
+                total_length, response_length, qkv_format, max_seq_len
             )
             loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
             loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
