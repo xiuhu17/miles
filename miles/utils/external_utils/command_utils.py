@@ -51,14 +51,15 @@ def convert_checkpoint(
 
     exec_command(
         f"source {repo_base_dir}/scripts/models/{megatron_model_type}.sh && "
-        f"PYTHONPATH=/root/Megatron-LM "
+        # Use installed Megatron instead of hardcoded path
+        f"PYTHONPATH=/host_home/primary_synced/Megatron-LM "
         f"torchrun "
         f"--nproc-per-node {num_gpus_per_node} "
         f"{multinode_args}"
         f"tools/convert_hf_to_torch_dist.py "
         "${MODEL_ARGS[@]} "
         f"--hf-checkpoint {hf_checkpoint} "
-        f"--save {path_dst}"
+        f"--save {path_dst} "
         f"{extra_args}"
     )
 
@@ -139,7 +140,8 @@ def execute_train(
     runtime_env_json = json.dumps(
         {
             "env_vars": {
-                "PYTHONPATH": "/root/Megatron-LM/",
+                # Use installed Megatron instead of hardcoded path
+                "PYTHONPATH": "/host_home/primary_synced/Megatron-LM/",
                 # If setting this in FSDP, the computation communication overlapping may have issues
                 **(
                     {}

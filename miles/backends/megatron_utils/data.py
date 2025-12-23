@@ -26,6 +26,7 @@ def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
     pad_multiplier: int = 128,
+    use_thd: bool = True,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.

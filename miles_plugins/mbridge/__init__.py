@@ -16,7 +16,7 @@ _original_from_config = AutoBridge.from_config
 
 @classmethod
 def _patched_from_config(cls, hf_config, **kwargs):
-    if hf_config.model_type == "deepseek_v32":
+    if hasattr(hf_config, 'index_n_heads'):
         from mbridge.core.bridge import _MODEL_REGISTRY
         return _MODEL_REGISTRY['deepseek_v32'](hf_config, **kwargs)
     
