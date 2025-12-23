@@ -55,11 +55,11 @@ def get_responses(
         (1D int64), both aligned to response tokens for one sample.
     """
     qkv_format = args.qkv_format
-    
+
     assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
 
-    if qkv_format == 'thd':
+    if qkv_format == "thd":
         assert logits.size(0) == 1, f"{logits.shape}"
         logits = logits.squeeze(0)
     else:
@@ -70,10 +70,12 @@ def get_responses(
 
     cp_size = mpu.get_context_parallel_world_size
     end = 0
-    for i, (tokens, total_length, response_length) in enumerate(zip(unconcat_tokens, total_lengths, response_lengths, strict=False)):
+    for i, (tokens, total_length, response_length) in enumerate(
+        zip(unconcat_tokens, total_lengths, response_lengths, strict=False)
+    ):
         if cp_size == 1:
-            if qkv_format == 'bshd': 
-                logits_chunk = logits[total_length - response_length - 1:total_length - 1]
+            if qkv_format == "bshd":
+                logits_chunk = logits[total_length - response_length - 1 : total_length - 1]
                 tokens_chunk = tokens[-response_length:]
             else:
                 end += total_length
@@ -97,9 +99,7 @@ def get_responses(
             tokens_1 = tokens[tokens_offset[1][0] : tokens_offset[1][1]]
 
             assert logits_0.size(0) == tokens_0.size(0), f"{logits_0.size(0)} vs {tokens_0.size(0)}"
-            assert logits_1.size(0) == tokens_1.size(0), f"{logits_1.size(0)} vs {tokens_1.size(0)}, chunks_offset {chunks_offset}, logits_offset {logits_offset}, \
-                tokens_offset {tokens_offset}, logits_1 range {(end + chunk_size, end + 2 * chunk_size)}, chunk_size {chunk_size}, max_seq_len {_max_seq_len}, \
-                logits.shape {logits.shape}"
+            assert logits_1.size(0) == tokens_1.size(0), f"{logits_1.size(0)} vs {tokens_1.size(0)}"
 
             logits_chunk = torch.cat([logits_0, logits_1], dim=0)
             tokens_chunk = torch.cat([tokens_0, tokens_1], dim=0)
@@ -337,7 +337,9 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
                 prompt_len = total_len - response_len
                 max_seq_len = max_seq_len[i] if max_seq_len is not None else None
 
-                _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(total_len, response_len, args.qkv_format, max_seq_len)
+                _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(
+                    total_len, response_len, args.qkv_format, max_seq_len
+                )
 
                 # Convert global offsets to response-space offsets
                 s0, e0 = token_offsets[0]
@@ -553,7 +555,12 @@ def policy_loss_function(
         # [decouple IS and rejection] Rebuild sum_of_sample_mean with modified_response_masks for denominator correction
         # modified_response_masks will be sliced with cp in get_sum_of_sample_mean
         sum_of_sample_mean = get_sum_of_sample_mean(
-            total_lengths, response_lengths, modified_response_masks, args.calculate_per_token_loss, args.qkv_format, batch.get("max_seq_len", None),
+            total_lengths,
+            response_lengths,
+            modified_response_masks,
+            args.calculate_per_token_loss,
+            args.qkv_format,
+            batch.get("max_seq_len", None),
         )
 
     pg_loss = sum_of_sample_mean(pg_loss)

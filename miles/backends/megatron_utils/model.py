@@ -210,7 +210,10 @@ def forward_only(
 
         # Get the batch.
         batch = get_batch(
-            data_iterator, ["tokens", "total_lengths", "response_lengths", "max_seq_len"], args.data_pad_size_multiplier, args.qkv_format
+            data_iterator,
+            ["tokens", "total_lengths", "response_lengths", "max_seq_len"],
+            args.data_pad_size_multiplier,
+            args.qkv_format,
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]

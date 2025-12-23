@@ -123,7 +123,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 choices=["thd", "bshd"],
                 default="thd",
-                help="The qkv layout for Megatron backend."
+                help="The qkv layout for Megatron backend.",
             )
             parser.add_argument(
                 "--true-on-policy-mode",
@@ -1592,8 +1592,11 @@ def miles_validate_args(args):
     if args.prefill_num_servers is not None:
         assert not args.use_fault_tolerance, "fault tolerance is not supported when prefill_num_servers is set."
 
-    assert args.qkv_format in ['thd', 'bshd'], f"qkv_format {args.qkv_format} is not supported. (only 'thd' and 'bshd' are supported)"
-    if args.qkv_format == 'bshd':
+    assert args.qkv_format in [
+        "thd",
+        "bshd",
+    ], f"qkv_format {args.qkv_format} is not supported. (only 'thd' and 'bshd' are supported)"
+    if args.qkv_format == "bshd":
         assert args.train_backend == "megatron", "bshd format is only supported for megatron backend."
 
 

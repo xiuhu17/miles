@@ -88,7 +88,9 @@ def get_sum_of_sample_mean(
         ):
             _max_seq_len = max_seq_len[i] if max_seq_len is not None else None
             prompt_length = total_length - response_length
-            _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(total_length, response_length, qkv_format, _max_seq_len)
+            _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
+                total_length, response_length, qkv_format, _max_seq_len
+            )
             loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
             loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
             chunked_loss_masks.append(torch.cat([loss_mask_0, loss_mask_1], dim=0))
@@ -169,7 +171,12 @@ def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length:
     return full_tensor
 
 
-def slice_with_cp(tokens: torch.Tensor, pad_value: tuple[int, float, Callable], qkv_format: str = 'thd', max_token_len: int | None = None) -> torch.Tensor:
+def slice_with_cp(
+    tokens: torch.Tensor,
+    pad_value: tuple[int, float, Callable],
+    qkv_format: str = "thd",
+    max_token_len: int | None = None,
+) -> torch.Tensor:
     cp_rank = mpu.get_context_parallel_rank()
     cp_size = mpu.get_context_parallel_world_size()
 
@@ -215,7 +222,9 @@ def slice_log_prob_with_cp(
         return log_prob
 
     prompt_length = total_length - response_length
-    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length, qkv_format, max_token_len)
+    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
+        total_length, response_length, qkv_format, max_token_len
+    )
 
     chunk_1 = log_prob[logits_offset[0][0] - (prompt_length - 1) : logits_offset[0][1] - (prompt_length - 1)]
     chunk_2 = log_prob[logits_offset[1][0] - (prompt_length - 1) : logits_offset[1][1] - (prompt_length - 1)]

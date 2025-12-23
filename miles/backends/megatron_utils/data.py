@@ -23,10 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_batch(
-    data_iterator: "DataIterator",
-    keys: Sequence[str],
-    pad_multiplier: int = 128,
-    qkv_format: str = "thd"
+    data_iterator: "DataIterator", keys: Sequence[str], pad_multiplier: int = 128, qkv_format: str = "thd"
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
@@ -67,9 +64,9 @@ def get_batch(
         max_seqlen = batch["max_seq_len"][0]
         assert max([t.size(0) for t in tokens]) <= max_seqlen
         tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
-        tokens = torch.stack(tokens) 
+        tokens = torch.stack(tokens)
         # TODO: padding to multiples?
-        
+
     elif qkv_format == "thd":
         tokens = [slice_with_cp(t, pad_token_id, qkv_format) for t in tokens]
 
@@ -349,7 +346,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                             response_lengths,
                             loss_masks,
                             qkv_format=args.qkv_format,
-                            max_seq_len=max_seq_len
+                            max_seq_len=max_seq_len,
                         )
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
