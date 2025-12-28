@@ -18,8 +18,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     mode: Literal["normal", "debug_minimal"] = "debug_minimal"
     run_id: str = U.create_run_id()
     model_org: str = "deepseek-ai"
-    model_name: Literal["DeepSeek-V3.2", "DeepSeek-V3.2-5layer"] = "DeepSeek-V3.2-5layer"
-    megatron_model_type: Literal["deepseek-v32", "deepseek-v32-5layer"] = "deepseek-v32-5layer"
+    model_name: Literal["DeepSeek-V3.2", "DeepSeek-V3.2-5layer"] = "DeepSeek-V3.2"
+    megatron_model_type: Literal["deepseek-v32", "deepseek-v32-5layer"] = "deepseek-v32"
     num_gpus_per_node: int = 4
     enable_eval: bool = True
     extra_args: str = ""
@@ -164,10 +164,10 @@ def train(args: ScriptArgs):
     else:
         # TODO choose a good config (currently randomly change to suit 64gpu)
         perf_args = (
-            "--tensor-model-parallel-size 1 "
+            "--tensor-model-parallel-size 8 "
             "--sequence-parallel "
             f"--pipeline-model-parallel-size {1 if args.model_name == 'DeepSeek-V3.2-5layer' else 4} "
-            "--context-parallel-size 8 "
+            "--context-parallel-size 2 "
             "--expert-model-parallel-size 16 "
             "--expert-tensor-parallel-size 1 "
         )
@@ -179,7 +179,8 @@ def train(args: ScriptArgs):
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
         # ------------
-        "--use-dynamic-batch-size "
+        # "--use-dynamic-batch-size "
+        "--micro-batch-size 1 "
         # TODO temp use tiny value
         "--max-tokens-per-gpu 2048 "
         # "--max-tokens-per-gpu 16384 "
@@ -266,6 +267,7 @@ def train(args: ScriptArgs):
         "--model-name deepseekv32 " # for mbridge load
         "--train-memory-margin-bytes 1073741824 "
         # "--check-weight-update-equal "
+        "--qkv-format bshd "
     )
 
     train_args = (
