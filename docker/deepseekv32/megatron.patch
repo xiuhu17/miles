@@ -410,7 +410,7 @@ index fc994490b..7bc9a485e 100644
          # ===================================
          # Attach indexer loss
 diff --git a/megatron/core/transformer/multi_latent_attention.py b/megatron/core/transformer/multi_latent_attention.py
-index 3953d933b..0ec5029dd 100644
+index 3953d933b..84301ed54 100644
 --- a/megatron/core/transformer/multi_latent_attention.py
 +++ b/megatron/core/transformer/multi_latent_attention.py
 @@ -6,6 +6,7 @@ from dataclasses import dataclass
@@ -421,109 +421,6 @@ index 3953d933b..0ec5029dd 100644
  
  try:
      from einops import rearrange
-@@ -198,6 +199,64 @@ class MultiLatentAttention(Attention):
-             # the quantized tensor.
-             set_save_original_input(self.linear_proj)
- 
-+    def convert_thd_and_bsnh(self, src, packed_seq_params, to_bsd):
-+        pg = parallel_state.get_context_parallel_group()
-+        cp_size = parallel_state.get_context_parallel_world_size()
-+        cp_rank = parallel_state.get_context_parallel_rank()
-+
-+        seq_len_global = packed_seq_params.max_seqlen_q
-+        seq_len_local = seq_len_global // cp_size
-+        cu_seqlens_local = packed_seq_params.cu_seqlens_q // cp_size
-+        b = len(packed_seq_params.cu_seqlens_q) - 1
-+        t = cu_seqlens_local[-1].item()
-+        d = src.shape[-1]
-+
-+        if to_bsd:
-+            dst = torch.zeros(seq_len_local, b, d, 
-+                                device=src.device, dtype=src.dtype)
-+        else:
-+            dst = torch.empty((t, 1, d), device=src.device, dtype=src.dtype)
-+
-+        if cp_size == 1:
-+            for i in range(b):
-+                start, end = cu_seqlens_local[i].item(), cu_seqlens_local[i+1].item()
-+                if to_bsd:
-+                    dst[:end-start, i] = src[start:end, 0]
-+                else:
-+                    dst[start:end, 0] = src[:end-start, i]
-+        else:
-+            gathered = torch.stack( # TODO, may be too large? largest size: cp_size * s * b * h
-+                torch.distributed.nn.functional.all_gather(src, group=pg), dim=0
-+            )
-+            for i in range(b):
-+                start, end = cu_seqlens_local[i].item(), cu_seqlens_local[i+1].item()
-+                len_i = end - start
-+                half_len_i = len_i // 2
-+                half = start + half_len_i
-+                chunk_size = seq_len_local // 2
-+                s1, e1 = chunk_size * cp_rank, chunk_size * (cp_rank + 1)
-+                s2, e2 = chunk_size * (2 * cp_size - cp_rank - 1), chunk_size * (2 * cp_size - cp_rank)
-+
-+                if to_bsd:
-+                    first_half = gathered[:, start:half, 0].contiguous().view(cp_size * half_len_i, -1)
-+                    second_half = gathered[:, half:end, 0].flip(dims=[0]).contiguous().view(cp_size * half_len_i, -1)
-+                    padded = F.pad(
-+                        torch.cat([first_half, second_half], dim=0),
-+                        (0, 0, 0, seq_len_global - cp_size * len_i), value=0
-+                    )
-+                    dst[:, i] = torch.cat([padded[s1:e1], padded[s2:e2]], dim=0)
-+                else:
-+                    first_chunk = gathered[:, :chunk_size, i] # s1, s2, ...
-+                    second_chunk = gathered[:, chunk_size:seq_len_local, i].flip(dims=[0]) # s_n, s_n-1 ...
-+
-+                    full_padded = torch.cat([first_chunk, second_chunk], dim=0).contiguous().view(seq_len_global, d)
-+
-+
-+                    dst[start:half, 0] = full_padded[half_len_i * cp_rank:half_len_i * (cp_rank + 1)]
-+                    dst[half:end, 0] = full_padded[half_len_i * (2 * cp_size - cp_rank - 1):half_len_i * (2 * cp_size - cp_rank)]
-+
-+        return dst
-+
-     def forward(
-         self,
-         hidden_states,
-@@ -237,6 +296,13 @@ class MultiLatentAttention(Attention):
-         if self.config.cache_mla_latents:
-             self.prepare_for_absorption()
- 
-+        original_packed_seq_params = None
-+        if (self.config.experimental_attention_variant == "dsa" and 
-+            packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'):
-+            original_packed_seq_params = packed_seq_params
-+            hidden_states = self.convert_thd_and_bsnh(hidden_states, packed_seq_params, to_bsd=True)
-+            packed_seq_params = None
-+
-         # =====================
-         # Query, Key, and Value
-         # =====================
-@@ -306,8 +372,6 @@ class MultiLatentAttention(Attention):
-                             attn_mask_type=attn_mask_type,
-                         )
-                     elif self.config.experimental_attention_variant == "dsa":
--                        # For dsa we need to pass in the original hidden states and the compressed
--                        # query representation.
-                         core_attn_out = self.core_attention(
-                             query,
-                             key,
-@@ -358,11 +422,9 @@ class MultiLatentAttention(Attention):
-             # Flatten back: [seq, batch, num_heads * v_head_dim]
-             core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), -1)
- 
--        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
--            # reshape to same output shape as unpacked case
--            # (t, np, hn) -> (t, b=1, h=np*hn)
--            # t is the pack size = sum (sq_i)
--            # note that batch is a dummy dimension in the packed case
-+        if original_packed_seq_params is not None:
-+            core_attn_out = self.convert_thd_and_bsnh(core_attn_out, original_packed_seq_params, to_bsd=False)
-+        elif packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
- 
-         if self.recompute_up_proj:
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
 index a3a167549..98391fda6 100644
 --- a/megatron/core/transformer/transformer_config.py
