@@ -131,18 +131,31 @@ class AllGatherComm:
                 handle.wait()
             self.handles = []
 
+
 # assume -inf as mask, 1 as non
-# zz_indices: [seq_len, batch, kv_group, seq_len_kv]
-def to_zz_mask_attn_bias_topk(attention_mask=None, indices, K: int, cp_size, device, dtype):
+# zz_indices: [seq_len_shard, batch, kv_group, seq_len_kv]
+def to_zz_mask_attn_bias_topk(attention_mask=None, indices, attention_mask_shuffled: bool = False, indices_shuffled: bool=False, K: int, cp_size, device, dtype):
+    
+    def shuffle(mask):
+        chunked_mask = mask.chunk(dim=3, chunks=cp_size * 2)
+        zz_chunked_mask = [_x for _p in zip(chunked_mask[:cp_size], reversed(chunked_mask[cp_size:])) for _x in _p]
+        return torch.cat(zz_chunked_mask, dim=3)
+
     topk_mask = torch.full_like(attention_mask, float("-inf"), device=device, dtype=dtype,)
     topk_mask.scatter_(dim=3, index=indices, value=1)
+
     if attention_mask is None:
-        zz_mixed_mask = topk_mask
+        mixed_mask = topk_mask
+        if indices_shuffled:
+            zz_mixed_mask = mixed_mask
+        else:
+            zz_mixed_mask = shuffle(mixed_mask)
     else:
-        mixed_mask = topk_mask + attention_mask
-        chunked = mixed_mask.chunk(dim=3, chunks=cp_size * 2)
-        zz_mixed_mask = [_x for _p in zip(chunked[:cp_size], reversed(chunked[cp_size:])) for _x in _p]
-        zz_mixed_mask = torch.cat(zz_mask, dim=3)
+        if not attention_mask_shuffled:
+            attention_mask = shuffle(attention_mask)
+        if not indices_shuffled:
+            topk_mask = shuffle(topk_mask)
+        zz_mixed_mask = topk_mask + attention_mask
     
     _, zz_indices = torch.topk(zz_mixed_mask, K, dim=3)
     return zz_indices
@@ -150,14 +163,14 @@ def to_zz_mask_attn_bias_topk(attention_mask=None, indices, K: int, cp_size, dev
 class AttentionFuncionWithContextParallel(torch.autograd.Function):
     """Native attention function with context parallelism."""
 
-    # q: [seq_len, batch, nheads, dim + tail_dim]
-    # kv: [seq_len_kv, batch, kv_group, dim + tail_dim]
-    #   k: [seq_len_kv, batch, kv_group, dim + tail_dim]
-    #   v: [seq_len_kv, batch, kv_group, dim]
-    # mask: [seq_len, batch, kv_group, seq_len_kv], full
-    # topk: [seq_len, batch, kv_group, topk], full
+    # q: [seq_len_shard, batch, nheads, dim + tail_dim]
+    # kv: [seq_len_kv_shard, batch, kv_group, dim + tail_dim]
+    #   k: [seq_len_kv_shard, batch, kv_group, dim + tail_dim]
+    #   v: [seq_len_kv_shard, batch, kv_group, dim]
+    # mask: [seq_len_shard, batch, kv_group, seq_len_kv]
+    # topk: [seq_len_shard, batch, kv_group, topk]
     @staticmethod
-    def forward(ctx, q, kv, attention_mask=None, indices, attention_dropout, K: int, softmax_scale, pg):
+    def forward(ctx, q, kv, attention_mask=None, indices, attention_mask_shuffled: bool = False, indices_shuffled: bool=False, K: int, attention_dropout, softmax_scale, pg):
         '''Forward pass for the native attention function with context parallelism'''
 
         # Assert einops exists
@@ -190,11 +203,11 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
 
         # Prepare attention bias
         zz_indices = to_zz_mask_attn_bias_topk(
-            attention_mask, indices, K, cp_size, q.device, q.dtype
+            attention_mask, indices, attention_mask_shuffled, indices_shuffled, K, cp_size, q.device, q.dtype
         )
         zz_indices = einops.rearrange(zz_indices, 's b h k -> b s h k')
 
-        # Iterate over heads
+        # Iterate over heads, sequential, i
         for i in range(0, kv_group, heads_kv_stride):
             # Wait for previous all-gather to complete
             comm.wait()
@@ -218,17 +231,17 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
             # Forward pass
             out_i, lse_i = sparse_mla_fwd_interface(q_i, kv_i, zz_indices_i, sm_scale = softmax_scale)
 
-            outs.append(out_i)
-            lses.append(lse_i)
+            outs.append(out_i.contiguous())
+            lses.append(lse_i.contiguous())
 
-        # out: [B, seq_len, h, dim] -> [seq_len, B, h, dim]
+        # out: [B, seq_len_shard, h, dim] -> [seq_len, B, h, dim]
         out = torch.cat(outs, dim=2)
         out = einops.rearrange(out, 'b s h d -> s b h d')
 
         # Save contexts for backward pass
-        # outs: [[B, seq_len, 1, dim], ...., [B, seq_len, 1, dim]]
-        # lses: [[B, seq_len, 1], ...., [B, seq_len, 1]]
-        ctx.save_for_backward(q, kv, attention_mask, indices, *outs, *lses)
+        # outs: [[B, seq_len_shard, 1, dim], ...., [B, seq_len_shard, 1, dim]]
+        # lses: [[B, seq_len_shard, 1], ...., [B, seq_len_shard, 1]]
+        ctx.save_for_backward(q, kv, attention_mask, indices, attention_mask_shuffled, indices_shuffled, *outs, *lses)
         ctx.dropout = attention_dropout
         ctx.scale = softmax_scale
         ctx.heads_kv_stride = heads_kv_stride  # TODO make it configurable
@@ -241,13 +254,15 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         '''Backward pass for the native attention function with context parallelism'''
 
         # Initialize or resume constants and communication group
-        q, kv, attention_mask, indices, outs, lses = ctx.saved_tensors
+        q, kv, attention_mask, indices, attention_mask_shuffled, indices_shuffled, *rest = ctx.saved_tensors
         nheads = q.shape[2]
         kv_group = kv.shape[2]
-        heads_k_stride = ctx.heads_k_stride
-        assert kv_group % heads_k_stride == 0
-        outs = rest[: kv_group // heads_k_stride]
-        probs = rest[kv_group // heads_k_stride :]
+        heads_kv_stride = ctx.heads_kv_stride
+        assert kv_group % heads_kv_stride == 0
+
+        outs = rest[: kv_group // heads_kv_stride]
+        probs = rest[kv_group // heads_kv_stride :]
+
         pg = ctx.pg
         cp_size = 1
         if pg is not None:
@@ -342,7 +357,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         dq = torch.cat(dq, dim=2)
         dk = torch.cat(dk, dim=2)
         dv = torch.cat(dv, dim=2)
-        return dq, dkv, None, None, None, None, None, None
+        return dq, dkv, None, None, None, None, None, None, None
 
 class Test(torch.autograd.Function):
     @staticmethod
