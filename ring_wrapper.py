@@ -134,7 +134,7 @@ class AllGatherComm:
 
 # assume -inf as mask, 1 as non
 # zz_indices: [seq_len_shard, batch, kv_group, seq_len_kv]
-def to_zz_mask_attn_bias_topk(attention_mask=None, indices, attention_mask_shuffled: bool = False, indices_shuffled: bool=False, K: int, cp_size, device, dtype):
+def to_zz_mask_attn_bias_topk(attention_mask, indices, attention_mask_shuffled: bool, indices_shuffled: bool, K: int, cp_size, device, dtype):
     
     def shuffle(mask):
         chunked_mask = mask.chunk(dim=3, chunks=cp_size * 2)
@@ -170,7 +170,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
     # mask: [seq_len_shard, batch, kv_group, seq_len_kv]
     # topk: [seq_len_shard, batch, kv_group, topk]
     @staticmethod
-    def forward(ctx, q, kv, attention_mask=None, indices, attention_mask_shuffled: bool = False, indices_shuffled: bool=False, K: int, attention_dropout, softmax_scale, pg):
+    def forward(ctx, q, kv, attention_mask, indices, attention_mask_shuffled: bool, indices_shuffled: bool, K: int, attention_dropout, softmax_scale, pg):
         '''Forward pass for the native attention function with context parallelism'''
 
         # Assert einops exists
@@ -191,9 +191,9 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
 
         # Initialize KV buffers
         kv_buffer = torch.empty(
-            (kv.shape[0] * cp_size, kv.shape[1], heads_kv_stride, k.shape[3]),
-            dtype=k.dtype,
-            device=k.device,
+            (kv.shape[0] * cp_size, kv.shape[1], heads_kv_stride, kv.shape[3]),
+            dtype=kv.dtype,
+            device=kv.device,
         )
         kv_buffer_copy = torch.empty_like(kv_buffer)
 
@@ -239,11 +239,14 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         out = einops.rearrange(out, 'b s h d -> s b h d')
 
         # Save contexts for backward pass
-        # outs: [[B, seq_len_shard, 1, dim], ...., [B, seq_len_shard, 1, dim]]
-        # lses: [[B, seq_len_shard, 1], ...., [B, seq_len_shard, 1]]
-        ctx.save_for_backward(q, kv, attention_mask, indices, attention_mask_shuffled, indices_shuffled, *outs, *lses)
+        # outs: [[B, seq_len_shard, nheads // kv_group, dim], ...., [B, seq_len_shard, nheads // kv_group, dim]], repeat kv_group // heads_kv_stride times
+        # lses: [[B, seq_len_shard, heads_kv_stride], ...., [B, seq_len_shard, heads_kv_stride]], repeat kv_group // heads_kv_stride times
+        ctx.save_for_backward(q, kv, attention_mask, indices, *outs, *lses)
+        ctx.attention_mask_shuffled = attention_mask_shuffled
+        ctx.indices_shuffled = indices_shuffled
+        ctx.K = K
         ctx.dropout = attention_dropout
-        ctx.scale = softmax_scale
+        ctx.softmax_scale = softmax_scale
         ctx.heads_kv_stride = heads_kv_stride  # TODO make it configurable
         ctx.pg = pg
 
@@ -254,14 +257,18 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         '''Backward pass for the native attention function with context parallelism'''
 
         # Initialize or resume constants and communication group
-        q, kv, attention_mask, indices, attention_mask_shuffled, indices_shuffled, *rest = ctx.saved_tensors
+        q, kv, attention_mask, indices, *rest = ctx.saved_tensors
+        K = ctx.K
+        attention_mask_shuffled = ctx.attention_mask_shuffled
+        indices_shuffled = ctx.indices_shuffled
         nheads = q.shape[2]
         kv_group = kv.shape[2]
         heads_kv_stride = ctx.heads_kv_stride
+        softmax_scale = ctx.softmax_scale
         assert kv_group % heads_kv_stride == 0
 
         outs = rest[: kv_group // heads_kv_stride]
-        probs = rest[kv_group // heads_kv_stride :]
+        lses = rest[kv_group // heads_kv_stride :]
 
         pg = ctx.pg
         cp_size = 1
@@ -271,30 +278,28 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
 
         # Initialize KV buffers
         kv_buffer = torch.empty(
-            (2, k.shape[0] * cp_size, k.shape[1], heads_k_stride, k.shape[3]),
-            dtype=k.dtype,
-            device=k.device,
+            (kv.shape[0] * cp_size, kv.shape[1], heads_kv_stride, kv.shape[3]),
+            dtype=kv.dtype,
+            device=kv.device,
         )
         kv_buffer_copy = torch.empty_like(kv_buffer)
 
         # All-gather first chunk of KV buffers
         dq = []
-        dk = []
-        dv = []
-        k_0 = k[:, :, :heads_k_stride].contiguous()
-        v_0 = v[:, :, :heads_k_stride].contiguous()
-        comm.all_gather(kv_buffer_copy[0], k_0)
-        comm.all_gather(kv_buffer_copy[1], v_0)
+        dkv = []
+        kv_0 = kv[:, :, :heads_kv_stride].contiguous()
+        comm.all_gather(kv_buffer_copy, kv_0)
 
         # Prepare attention bias
         zz_indices = to_zz_mask_attn_bias_topk(
-            attention_mask, indices, K, cp_size, q.device, q.dtype
+            attention_mask, indices, attention_mask_shuffled, indices_shuffled, K, cp_size, q.device, q.dtype
         )
+        zz_indices = einops.rearrange(zz_indices, 's b h k -> b s h k')
 
         # Iterate over heads
-        for i in range(0, kv_group, heads_k_stride):
+        for i in range(0, kv_group, heads_kv_stride):
             # Slice query and output for this iteration
-            q_slice = slice(i * nheads // kv_group, (i + heads_k_stride) * nheads // kv_group)
+            q_slice = slice(i * nheads // kv_group, (i + heads_kv_stride) * nheads // kv_group)
             q_i = q[:, :, q_slice]
             dout_i = dout[:, :, q_slice]
 
@@ -303,67 +308,44 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
             kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
 
             # All-gather the next portion of KV buffers if not the last iteration
-            if i < kv_group - heads_k_stride:
-                kvsl = i + heads_k_stride
-                kvsr = kvsl + heads_k_stride
-                send_k = k[:, :, kvsl:kvsr].contiguous()
-                send_v = v[:, :, kvsl:kvsr].contiguous()
-                comm.all_gather(kv_buffer_copy[0], send_k)
-                comm.all_gather(kv_buffer_copy[1], send_v)
+            if i < kv_group - heads_kv_stride:
+                kvsl = i + heads_kv_stride
+                kvsr = kvsl + heads_kv_stride
+                send_kv = kv[:, :, kvsl:kvsr].contiguous()
+                comm.all_gather(kv_buffer_copy, send_kv)
 
             # Prepare key, value for attention
-            k_i = kv_buffer[0]
-            v_i = kv_buffer[1]
+            kv_i = kv_buffer
 
             # Rearrange query, key, value to (b, s, h, d)
             q_i = einops.rearrange(q_i, 's b h d -> b s h d')
-            k_i = einops.rearrange(k_i, 's b h d -> b s h d')
-            v_i = einops.rearrange(v_i, 's b h d -> b s h d')
+            kv_i = einops.rearrange(kv_i, 's b h d -> b s h d')
             dout_i = einops.rearrange(dout_i, 's b h d -> b s h d')
+            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)]
 
             # Backward pass
-            dq_i, _dk_i, _dv_i, _ = eager_attn_bwd(
-                q_i, k_i, v_i, attn_bias, None, ctx.scale, ctx.dropout, outs[i], probs[i], dout_i
-            )
+            # TODO: needs casual = True, may not be compatible with zz
+            dq_i, _dkv_i = sparse_mla_bwd(q_i, kv_i, outs[i], dout_i, zz_indices_i, lses[i], softmax_scale, True)
 
             # Rearrange gradients to (s, b, h, d)
             dq_i = einops.rearrange(dq_i, 'b s h d -> s b h d')
-            _dk_i = einops.rearrange(_dk_i, 'b s h d -> s b h d')
-            _dv_i = einops.rearrange(_dv_i, 'b s h d -> s b h d')
+            _dkv_i = einops.rearrange(_dkv_i, 'b s h d -> s b h d')
             if pg is None:
-                dk_i = _dk_i
-                dv_i = _dv_i
+                dkv_i = _dkv_i
             else:
                 # Reduce-scatter gradients if CP > 1
-                dk_i = torch.zeros(
-                    (k_i.shape[1] // cp_size, k_i.shape[0], k_i.shape[2], k_i.shape[3]),
-                    device=k_i.device,
-                    dtype=k_i.dtype,
+                dkv_i = torch.zeros(
+                    (kv_i.shape[1] // cp_size, kv_i.shape[0], kv_i.shape[2], kv_i.shape[3]),
+                    device=kv_i.device,
+                    dtype=kv_i.dtype,
                 )
-                dv_i = torch.zeros(
-                    (v_i.shape[1] // cp_size, v_i.shape[0], v_i.shape[2], v_i.shape[3]),
-                    device=v_i.device,
-                    dtype=v_i.dtype,
-                )
-                torch.distributed.reduce_scatter_tensor(dk_i, _dk_i, group=pg)
-                torch.distributed.reduce_scatter_tensor(dv_i, _dv_i, group=pg)
+                torch.distributed.reduce_scatter_tensor(dkv_i, _dkv_i, group=pg)
 
             # Collect gradients
             dq.append(dq_i)
-            dk.append(dk_i)
-            dv.append(dv_i)
+            dkv.append(dkv_i)
 
         # Concatenate gradients and return
         dq = torch.cat(dq, dim=2)
-        dk = torch.cat(dk, dim=2)
-        dv = torch.cat(dv, dim=2)
+        dkv = torch.cat(dkv, dim=2)
         return dq, dkv, None, None, None, None, None, None, None
-
-class Test(torch.autograd.Function):
-    @staticmethod
-    def forward():
-        pass
-    
-    @staticmethod
-    def backward():
-        pass
