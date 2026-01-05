@@ -117,7 +117,8 @@ def test_kernel(
     q_local  = torch.cat([q_tmp[curr_rank],  q_tmp[mirror]],  dim=0).contiguous().requires_grad_()
     kv_local = torch.cat([kv_tmp[curr_rank], kv_tmp[mirror]], dim=0).contiguous().requires_grad_()
     k_full, v_full = kv_full.clone().contiguous(), kv_full[..., :dim].clone().contiguous()
-    k_local, v_local = kv_local.contiguous(), kv_local[..., :dim].contiguous()
+    k_local = kv_local.detach().clone().contiguous().requires_grad_(True)
+    v_local = kv_local[..., :dim].detach().clone().contiguous().requires_grad_(True)
 
     # indices: long, no grad
     perm = torch.randperm(seq_len_kv, device="cuda")
@@ -149,10 +150,12 @@ def test_kernel(
     q_local.grad = None
     k_local.grad = None
     v_local.grad = None
+    kv_local.grad = None
     res1 = Ref.apply(q_local, k_local, v_local, sparse_mask_local, attention_dropout, sm_scale, cp_pg, True)
     res1.backward(do)
     if dist.get_rank() == 0:
-        print(q_local.grad[0][0][0])
+        print(k_local.grad[0][0][4])
+        print(v_local.grad[0][0][4])
     # [batch, kv_group, seq_len, topk]
     q_local.grad = None
     k_local.grad = None
@@ -161,7 +164,7 @@ def test_kernel(
     res2 = AttentionFuncionWithContextParallel.apply(q_local, kv_local, indices_local, topk, attention_dropout, sm_scale, cp_pg)
     res2.backward(do)
     if dist.get_rank() == 0:
-        print(q_local.grad[0][0][0])
+        print(kv_local.grad[0][0][4])
 
 # run this test: rm -rf /tmp/tilelang_cache_clean && CUDA_VISIBLE_DEVICES=4,5,6,7 TILELANG_CACHE_DIR=/tmp/tilelang_cache_clean torchrun --nproc_per_node=4 /root/tilelang/examples/deepseek_v32/test.py
 test_kernel(32, 512, 512, 512, 64, 128, 128, 128, 4)
