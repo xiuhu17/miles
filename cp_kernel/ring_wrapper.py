@@ -5,7 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+import torch.distributed as dist
 from torch.nn import functional as F
+from sparse_mla_fwd import sparse_mla_fwd_interface
+from sparse_mla_bwd import sparse_mla_bwd
 
 try:
     import einops
@@ -82,8 +85,8 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         comm.all_gather(kv_buffer_copy, kv_0)
 
         # Prepare topk
-        zz_indices = einops.rearrange(indices, 'b h s topk -> b s h topk')
-
+        zz_indices = indices.transpose(1, 2)
+        
         # Iterate over heads, sequential, i
         for i in range(0, kv_group, heads_kv_stride):
             # Wait for previous all-gather to complete
@@ -103,10 +106,10 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
             # Rearrange query, key, value to (b, s, h, d)
             q_i = einops.rearrange(q_i, 's b h d -> b s h d')
             kv_i = einops.rearrange(kv_i, 's b h d -> b s h d')
-            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)]
+            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)].contiguous()
 
             # Forward pass
-            out_i, lse_i = sparse_mla_fwd_interface(q_i, kv_i, zz_indices_i, sm_scale = softmax_scale)
+            out_i, lse_i = sparse_mla_fwd_interface(q_i.contiguous(), kv_i.contiguous(), zz_indices_i, sm_scale = softmax_scale)
 
             outs.append(out_i.contiguous())
             lses.append(lse_i.contiguous())
@@ -164,7 +167,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         comm.all_gather(kv_buffer_copy, kv_0)
 
         # Prepare topk
-        zz_indices = einops.rearrange(indices, 'b h s topk -> b s h topk')
+        zz_indices = indices.transpose(1, 2)
 
         # Iterate over heads
         for i in range(0, kv_group, heads_kv_stride):
@@ -191,11 +194,11 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
             q_i = einops.rearrange(q_i, 's b h d -> b s h d')
             kv_i = einops.rearrange(kv_i, 's b h d -> b s h d')
             dout_i = einops.rearrange(dout_i, 's b h d -> b s h d')
-            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)]
+            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)].contiguous()
 
             # Backward pass
             # TODO: needs casual = True, may not be compatible with zz
-            dq_i, _dkv_i = sparse_mla_bwd(q_i, kv_i, outs[i], dout_i, zz_indices_i, lses[i], softmax_scale, True)
+            dq_i, _dkv_i = sparse_mla_bwd(q_i.contiguous(), kv_i.contiguous(), outs[i], dout_i.contiguous(), zz_indices_i, lses[i], softmax_scale, True)
 
             # Rearrange gradients to (s, b, h, d)
             dq_i = einops.rearrange(dq_i, 'b s h d -> s b h d')
@@ -219,3 +222,6 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         dq = torch.cat(dq, dim=2)
         dkv = torch.cat(dkv, dim=2)
         return dq, dkv, None, None, None, None, None
+
+
+
