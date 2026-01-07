@@ -1,177 +1,289 @@
 diff --git a/megatron/core/transformer/dot_product_attention_context_parallel.py b/megatron/core/transformer/dot_product_attention_context_parallel.py
-index 89659a1d7..77f1beb87 100644
+index 89659a1d7..4248e2bea 100644
 --- a/megatron/core/transformer/dot_product_attention_context_parallel.py
 +++ b/megatron/core/transformer/dot_product_attention_context_parallel.py
-@@ -6,6 +6,7 @@
+@@ -3,9 +3,12 @@
+ # Some of this code was adopted from https://github.com/zhuzilin/ring-flash-attention/
+ # This source code is licensed under the MIT license found in the
+ # LICENSE file in the root directory of this source tree.
++# Kernel is adpoted from tilelang/examples/deepseek_v32
  
  import torch
- from torch.nn import functional as F
 +import torch.distributed as dist
+ from torch.nn import functional as F
++from .tilelang_kernel import sparse_mla_fwd_interface, sparse_mla_bwd
  
  try:
      import einops
-@@ -53,15 +54,19 @@ def eager_attn_fwd(q, k, v, attn_bias, sinks, scale, dropout):
+@@ -15,96 +18,6 @@ except ImportError:
+     HAVE_EINOPS = False
  
  
- @torch.no_grad
--def eager_attn_bwd(q, k, v, attn_bias, sinks, scale, dropout, attn_output, probs, grad_output):
-+def eager_attn_bwd(q, kv, attn_bias, sinks, scale, dim_short, dropout, attn_output, probs, grad_output):
-     """Backward pass for eager attention"""
- 
-     # Rearrange query, key, value to (b, h, s, d)
-     b, sq, h, d = q.shape
+-@torch.no_grad
+-def eager_attn_fwd(q, k, v, attn_bias, sinks, scale, dropout):
+-    """Forward pass for eager attention"""
+-
+-    # Rearrange query, key, value to (b, h, s, d)
+-    b, sq, h, d = q.shape
 -    sk = k.shape[1]
-+    _, sk, _, _ = kv.shape
-+    k = kv
-+    v = kv[:,:,:,:dim_short]
-+    q_tail = q[:,:,:,dim_short:]
-+    _q_tail_T = einops.rearrange(q_tail, 'b s h d -> b h d s').contiguous()
-     _q_T = einops.rearrange(q, 'b s h d -> b h d s')
-     _k_T = einops.rearrange(k, 'b s h d -> b h s d')
+-    _q = einops.rearrange(q, 'b s h d -> b h s d')
+-    _k = einops.rearrange(k, 'b s h d -> b h d s')
+-    _v = einops.rearrange(v, 'b s h d -> b h s d')
+-
+-    # Compute attention weights
+-    attn_w = torch.matmul(_q, _k) * scale
+-    attn_w = attn_w + attn_bias
+-
+-    # Add sinks to attention weights
+-    if sinks is None:
+-        logits = attn_w
+-    else:
+-        _sinks = sinks.reshape(1, h, 1, 1).expand(b, -1, sq, 1)
+-        logits = torch.cat([attn_w, _sinks], dim=-1)
+-
+-    # Compute attention scores
+-    probs = F.softmax(logits, dim=-1, dtype=logits.dtype)
+-    if sinks is None:
+-        attn_w = probs
+-    else:
+-        attn_w = probs[..., :-1]  # Drop the sink
+-
+-    # Compute attention output
+-    attn_output = torch.matmul(attn_w, _v)
+-    attn_output = einops.rearrange(attn_output, 'b h s d -> b s h d')
+-    attn_output = attn_output.contiguous()
+-
+-    return attn_output, probs
+-
+-
+-@torch.no_grad
+-def eager_attn_bwd(q, k, v, attn_bias, sinks, scale, dropout, attn_output, probs, grad_output):
+-    """Backward pass for eager attention"""
+-
+-    # Rearrange query, key, value to (b, h, s, d)
+-    b, sq, h, d = q.shape
+-    sk = k.shape[1]
+-    _q_T = einops.rearrange(q, 'b s h d -> b h d s')
+-    _k_T = einops.rearrange(k, 'b s h d -> b h s d')
 -    _v_T = einops.rearrange(v, ' b s h d -> b h d s')
-+    _v_T = einops.rearrange(v, 'b s h d -> b h d s')
- 
-     # Backward pass for score @ value
-     if sinks is None:
-@@ -70,9 +75,9 @@ def eager_attn_bwd(q, k, v, attn_bias, sinks, scale, dropout, attn_output, probs
-         attn_w = probs[..., :-1]  # Drop the sink
-     grad_output = einops.rearrange(grad_output, 'b s h d -> b h s d')
-     attn_w_T = einops.rearrange(attn_w, ' b h sq sk -> b h sk sq')
+-
+-    # Backward pass for score @ value
+-    if sinks is None:
+-        attn_w = probs
+-    else:
+-        attn_w = probs[..., :-1]  # Drop the sink
+-    grad_output = einops.rearrange(grad_output, 'b s h d -> b h s d')
+-    attn_w_T = einops.rearrange(attn_w, ' b h sq sk -> b h sk sq')
 -    grad__v = torch.matmul(attn_w_T, grad_output)
 -    grad_attn_w = torch.matmul(grad_output, _v_T)
 -
-+    grad__v = torch.matmul(attn_w_T, grad_output).contiguous() # b h sk d
-+    grad_attn_w = torch.matmul(grad_output, _v_T).contiguous() # b h s d  || b h d sk -> b h s sk
-+ 
-     # Backward pass for softmax
-     if sinks is None:
-         grad_probs = grad_attn_w
-@@ -95,15 +100,18 @@ def eager_attn_bwd(q, k, v, attn_bias, sinks, scale, dropout, attn_output, probs
- 
-     # Backward pass for q @ K^T
-     grad_attn_w *= scale
+-    # Backward pass for softmax
+-    if sinks is None:
+-        grad_probs = grad_attn_w
+-    else:
+-        dummy = torch.zeros((b, h, sq, 1), device=q.device, dtype=q.dtype)
+-        grad_probs = torch.cat([grad_attn_w, dummy], dim=3)
+-    del grad_attn_w
+-    grad_logits = torch._softmax_backward_data(
+-        grad_probs, probs, -1, probs.dtype
+-    )  # [b, h, sq, sk+1]
+-
+-    # Backward pass for adding sinks
+-    if sinks is None:
+-        grad_sinks = None
+-        grad_attn_w = grad_logits
+-    else:
+-        grad__sinks = grad_logits[:, :, :, -1]  # [b, h, sq]
+-        grad_sinks = einops.rearrange(grad__sinks, 'b h s -> h (b s)').sum(-1)
+-        grad_attn_w = grad_logits[:, :, :, :-1].contiguous()  # [b, h, sq, sk]
+-
+-    # Backward pass for q @ K^T
+-    grad_attn_w *= scale
 -    grad__q = torch.matmul(grad_attn_w, _k_T)
 -    grad__k = torch.matmul(_q_T, grad_attn_w)
-+    grad__q = torch.matmul(grad_attn_w, _k_T).contiguous()
-+    grad__k = torch.matmul(_q_T, grad_attn_w).contiguous() # b h d sk
-+
-+    grad__k_T = grad__k.transpose(2, 3).contiguous() # b h sk d
-+    grad__kv = torch.zeros((b, h, sk, d), device=q.device, dtype=q.dtype) # b h sk d
-+    grad__kv[:,:,:,:dim_short] = grad__v + grad__k_T[:,:,:,:dim_short]
-+    grad__kv[:,:,:,dim_short:] = torch.matmul(_q_tail_T, grad_attn_w).contiguous().transpose(2, 3).contiguous() # b h sk d
- 
-     # Rearrange grads to (b, s, h, d)
+-
+-    # Rearrange grads to (b, s, h, d)
 -    grad_v = einops.rearrange(grad__v, 'b h s d -> b s h d')
 -    grad_k = einops.rearrange(grad__k, 'b h d s -> b s h d')
-+    grad__kv = grad__kv.transpose(1, 2).contiguous()
-     grad_q = einops.rearrange(grad__q, 'b h s d -> b s h d')
+-    grad_q = einops.rearrange(grad__q, 'b h s d -> b s h d')
 -    return grad_q, grad_k, grad_v, grad_sinks
 -
-+    return grad_q, grad__kv, grad_sinks
- 
+-
  class AllGatherComm:
      """All gather communication with async operations"""
-@@ -132,10 +140,10 @@ class AllGatherComm:
+ 
+@@ -131,27 +44,16 @@ class AllGatherComm:
+                 handle.wait()
              self.handles = []
  
- 
+-
 -def to_zz_mask_attn_bias(attention_mask, cp_size, nheads, nheads_k, heads_k_stride, device, dtype):
-+def to_zz_mask_attn_bias(attention_mask, cp_size, nheads, nheads_k, heads_k_stride, device, dtype, if_zz_mask=False):
-     '''Convert the attention mask to the attention bias'''
- 
+-    '''Convert the attention mask to the attention bias'''
+-
 -    if cp_size == 1:
-+    if cp_size == 1 or if_zz_mask:
-         zz_mask = attention_mask
-     else:
-         chunked = attention_mask.chunk(dim=3, chunks=cp_size * 2)
-@@ -151,7 +159,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+-        zz_mask = attention_mask
+-    else:
+-        chunked = attention_mask.chunk(dim=3, chunks=cp_size * 2)
+-        zz_mask = [_x for _p in zip(chunked[:cp_size], reversed(chunked[cp_size:])) for _x in _p]
+-        zz_mask = torch.cat(zz_mask, dim=3)
+-    attn_bias = torch.zeros(zz_mask.shape, device=device, dtype=dtype)
+-    attn_bias.masked_fill_(zz_mask, float('-inf'))
+-    attn_bias = attn_bias.expand(-1, heads_k_stride * (nheads // nheads_k), -1, -1)
+-    return attn_bias
+-
+-
+ class AttentionFuncionWithContextParallel(torch.autograd.Function):
      """Native attention function with context parallelism."""
  
++    # q: [seq_len_shard, batch, nheads, dim + tail_dim]
++    # kv: [seq_len_kv_shard, batch, kv_group, dim + tail_dim]
++    #   k: [seq_len_kv_shard, batch, kv_group, dim + tail_dim]
++    #   v: [seq_len_kv_shard, batch, kv_group, dim]
++    # indices: [batch, kv_group, seq_len, topk]
      @staticmethod
 -    def forward(ctx, q, k, v, attention_mask, attention_dropout, softmax_scale, pg):
-+    def forward(ctx, q, k, v, attention_mask, attention_dropout, softmax_scale, pg, if_zz_mask=False):
++    def forward(ctx, q, kv, v, indices, dim_v, K, attention_dropout, softmax_scale, pg):
          '''Forward pass for the native attention function with context parallelism'''
  
          # Assert einops exists
-@@ -171,12 +179,17 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
-         probs = []
+@@ -164,72 +66,71 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+             cp_size = torch.distributed.get_world_size(pg)
+         comm = AllGatherComm(group=pg)
+         nheads = q.shape[2]
+-        nheads_k = k.shape[2]
+-        heads_k_stride = 1
+-        assert nheads % nheads_k == 0 and nheads_k % heads_k_stride == 0
++        kv_group = kv.shape[2]
++        heads_kv_stride = 1
++        assert nheads % kv_group == 0 and kv_group % heads_kv_stride == 0
+         outs = []
+-        probs = []
++        lses = []
  
          # Initialize KV buffers
--        kv_buffer = torch.empty(
+         kv_buffer = torch.empty(
 -            (2, k.shape[0] * cp_size, k.shape[1], heads_k_stride, k.shape[3]),
-+        # seperate KV buffer for MLA
-+        kv_buffer = [torch.empty(
-+            (k.shape[0] * cp_size, k.shape[1], heads_k_stride, k.shape[3]),
-             dtype=k.dtype,
-             device=k.device,
--        )
--        kv_buffer_copy = torch.empty_like(kv_buffer)
-+        ), torch.empty(
-+            (v.shape[0] * cp_size, v.shape[1], heads_k_stride, v.shape[3]),
-+            dtype=v.dtype,
-+            device=v.device,
-+        )]
-+        kv_buffer_copy = [torch.empty_like(kv_buffer[0]), torch.empty_like(kv_buffer[1])]
+-            dtype=k.dtype,
+-            device=k.device,
++            (kv.shape[0] * cp_size, kv.shape[1], heads_kv_stride, kv.shape[3]),
++            dtype=kv.dtype,
++            device=kv.device,
+         )
+         kv_buffer_copy = torch.empty_like(kv_buffer)
  
          # All-gather first chunk of KV buffers
-         k_0 = k[:, :, :heads_k_stride].contiguous()
-@@ -186,7 +199,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
- 
-         # Prepare attention bias
-         attn_bias = to_zz_mask_attn_bias(
+-        k_0 = k[:, :, :heads_k_stride].contiguous()
+-        v_0 = v[:, :, :heads_k_stride].contiguous()
+-        comm.all_gather(kv_buffer_copy[0], k_0)
+-        comm.all_gather(kv_buffer_copy[1], v_0)
+-
+-        # Prepare attention bias
+-        attn_bias = to_zz_mask_attn_bias(
 -            attention_mask, cp_size, nheads, nheads_k, heads_k_stride, q.device, q.dtype
-+            attention_mask, cp_size, nheads, nheads_k, heads_k_stride, q.device, q.dtype, if_zz_mask
-         )
+-        )
+-
+-        # Iterate over heads
+-        for i in range(0, nheads_k, heads_k_stride):
++        kv_0 = kv[:, :, :heads_kv_stride].contiguous()
++        comm.all_gather(kv_buffer_copy, kv_0)
++
++        # Prepare topk
++        zz_indices = indices.transpose(1, 2)
++        
++        # Iterate over heads, sequential, i
++        for i in range(0, kv_group, heads_kv_stride):
+             # Wait for previous all-gather to complete
+             comm.wait()
+             kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
+             # All-gather the next portion of KV buffers if not the last iteration
+-            if i < nheads_k - heads_k_stride:
+-                kvsl = i + heads_k_stride
+-                kvsr = kvsl + heads_k_stride
+-                send_k = k[:, :, kvsl:kvsr].contiguous()
+-                send_v = v[:, :, kvsl:kvsr].contiguous()
+-                comm.all_gather(kv_buffer_copy[0], send_k)
+-                comm.all_gather(kv_buffer_copy[1], send_v)
++            if i < kv_group - heads_kv_stride:
++                kvsl = i + heads_kv_stride
++                kvsr = kvsl + heads_kv_stride
++                send_kv = kv[:, :, kvsl:kvsr].contiguous()
++                comm.all_gather(kv_buffer_copy, send_kv)
  
-         # Iterate over heads
-@@ -215,8 +228,9 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+             # Prepare query, key, value for attention
+-            q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
+-            k_i = kv_buffer[0]
+-            v_i = kv_buffer[1]
++            q_i = q[:, :, i * nheads // kv_group : (i + heads_kv_stride) * nheads // kv_group]
++            kv_i = kv_buffer
+ 
+             # Rearrange query, key, value to (b, s, h, d)
+             q_i = einops.rearrange(q_i, 's b h d -> b s h d')
+-            k_i = einops.rearrange(k_i, 's b h d -> b s h d')
+-            v_i = einops.rearrange(v_i, 's b h d -> b s h d')
++            s_, b_, h_, d_ = kv_i.shape
++            kv_i = einops.rearrange(kv_i, 's b h d -> b s h d').flatten().view(b_, s_, h_, d_)
++            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)]
++            b_, s_, g_, topk_ = zz_indices_i.shape
++            zz_indices_i = zz_indices_i.flatten().view(b_, s_, g_, topk_)
  
              # Forward pass
-             out_i, probs_i = eager_attn_fwd(
+-            out_i, probs_i = eager_attn_fwd(
 -                q_i, k_i, v_i, attn_bias, None, softmax_scale, attention_dropout
-+                q_i, k_i, v_i, attn_bias.contiguous(), None, softmax_scale, attention_dropout
-             )
+-            )
+-            outs.append(out_i)
+-            probs.append(probs_i)
++            out_i, lse_i = sparse_mla_fwd_interface(q_i.contiguous(), kv_i, zz_indices_i, dim_v, sm_scale = softmax_scale)
 +
-             outs.append(out_i)
-             probs.append(probs_i)
++            outs.append(out_i.contiguous())
++            lses.append(lse_i.contiguous())
  
-@@ -226,10 +240,13 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+-        # Concatenate outputs and rearrange to (s, b, h, d)
++        # out: [B, seq_len_shard, h, dim] -> [seq_len, B, h, dim]
+         out = torch.cat(outs, dim=2)
+         out = einops.rearrange(out, 'b s h d -> s b h d')
  
          # Save contexts for backward pass
-         ctx.save_for_backward(q, k, v, attention_mask, *outs, *probs)
-+        ctx.if_zz_mask = if_zz_mask
+-        ctx.save_for_backward(q, k, v, attention_mask, *outs, *probs)
++        # outs: [[B, seq_len_shard, nheads // kv_group, dim], ...., [B, seq_len_shard, nheads // kv_group, dim]], repeat kv_group // heads_kv_stride times
++        # lses: [[B, seq_len_shard, heads_kv_stride], ...., [B, seq_len_shard, heads_kv_stride]], repeat kv_group // heads_kv_stride times
++        ctx.save_for_backward(q, kv, indices, *outs, *lses)
++        ctx.K = K
          ctx.dropout = attention_dropout
-         ctx.scale = softmax_scale
-         ctx.heads_k_stride = heads_k_stride  # TODO make it configurable
+-        ctx.scale = softmax_scale
+-        ctx.heads_k_stride = heads_k_stride  # TODO make it configurable
++        ctx.softmax_scale = softmax_scale
++        ctx.heads_kv_stride = heads_kv_stride  # TODO make it configurable
          ctx.pg = pg
-+        ctx.dim = q.shape[3]
-+        ctx.dim_short = v.shape[3]
++        ctx.dim_v = dim_v
  
          return out
  
-@@ -238,13 +255,15 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+@@ -238,13 +139,18 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
          '''Backward pass for the native attention function with context parallelism'''
  
          # Initialize or resume constants and communication group
 -        q, k, v, attention_mask, *rest = ctx.saved_tensors
-+        q, kv, _, attention_mask, *rest = ctx.saved_tensors
-+        dim = ctx.dim
-+        dim_short = ctx.dim_short
++        q, kv, indices, *rest = ctx.saved_tensors
++        K = ctx.K
++        dim_v = ctx.dim_v
          nheads = q.shape[2]
 -        nheads_k = k.shape[2]
 -        heads_k_stride = ctx.heads_k_stride
 -        assert nheads_k % heads_k_stride == 0
 -        outs = rest[: nheads_k // heads_k_stride]
 -        probs = rest[nheads_k // heads_k_stride :]
-+        nheads_kv = kv.shape[2]
-+        heads_kv_stride = ctx.heads_k_stride
-+        assert nheads_kv % heads_kv_stride == 0
-+        outs = rest[: nheads_kv // heads_kv_stride]
-+        probs = rest[nheads_kv // heads_kv_stride :]
++        kv_group = kv.shape[2]
++        heads_kv_stride = ctx.heads_kv_stride
++        softmax_scale = ctx.softmax_scale
++        assert kv_group % heads_kv_stride == 0
++
++        outs = rest[: kv_group // heads_kv_stride]
++        lses = rest[kv_group // heads_kv_stride :]
++
          pg = ctx.pg
          cp_size = 1
          if pg is not None:
-@@ -253,30 +272,27 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+@@ -253,30 +159,25 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
  
          # Initialize KV buffers
          kv_buffer = torch.empty(
@@ -192,26 +304,28 @@ index 89659a1d7..77f1beb87 100644
 -        v_0 = v[:, :, :heads_k_stride].contiguous()
 -        comm.all_gather(kv_buffer_copy[0], k_0)
 -        comm.all_gather(kv_buffer_copy[1], v_0)
+-
+-        # Prepare attention bias
+-        attn_bias = to_zz_mask_attn_bias(
+-            attention_mask, cp_size, nheads, nheads_k, heads_k_stride, q.device, q.dtype
+-        )
 +        dkv = []
 +        kv_0 = kv[:, :, :heads_kv_stride].contiguous()
 +        comm.all_gather(kv_buffer_copy, kv_0)
- 
-         # Prepare attention bias
-         attn_bias = to_zz_mask_attn_bias(
--            attention_mask, cp_size, nheads, nheads_k, heads_k_stride, q.device, q.dtype
-+            attention_mask, cp_size, nheads, nheads_kv, heads_kv_stride, q.device, q.dtype, ctx.if_zz_mask
-         )
++
++        # Prepare topk
++        zz_indices = indices.transpose(1, 2)
  
          # Iterate over heads
 -        for i in range(0, nheads_k, heads_k_stride):
-+        for i in range(0, nheads_kv, heads_kv_stride):
++        for i in range(0, kv_group, heads_kv_stride):
              # Slice query and output for this iteration
 -            q_slice = slice(i * nheads // nheads_k, (i + heads_k_stride) * nheads // nheads_k)
-+            q_slice = slice(i * nheads // nheads_kv, (i + heads_kv_stride) * nheads // nheads_kv)
++            q_slice = slice(i * nheads // kv_group, (i + heads_kv_stride) * nheads // kv_group)
              q_i = q[:, :, q_slice]
              dout_i = dout[:, :, q_slice]
  
-@@ -285,58 +301,45 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+@@ -285,58 +186,47 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
              kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
  
              # All-gather the next portion of KV buffers if not the last iteration
@@ -222,7 +336,7 @@ index 89659a1d7..77f1beb87 100644
 -                send_v = v[:, :, kvsl:kvsr].contiguous()
 -                comm.all_gather(kv_buffer_copy[0], send_k)
 -                comm.all_gather(kv_buffer_copy[1], send_v)
-+            if i < nheads_kv - heads_kv_stride:
++            if i < kv_group - heads_kv_stride:
 +                kvsl = i + heads_kv_stride
 +                kvsr = kvsl + heads_kv_stride
 +                send_kv = kv[:, :, kvsl:kvsr].contiguous()
@@ -237,22 +351,26 @@ index 89659a1d7..77f1beb87 100644
              q_i = einops.rearrange(q_i, 's b h d -> b s h d')
 -            k_i = einops.rearrange(k_i, 's b h d -> b s h d')
 -            v_i = einops.rearrange(v_i, 's b h d -> b s h d')
-+            kv_i = einops.rearrange(kv_i, 's b h d -> b s h d')
++            s_, b_, h_, d_ = kv_i.shape
++            kv_i = einops.rearrange(kv_i, 's b h d -> b s h d').flatten().view(b_, s_, h_, d_)
              dout_i = einops.rearrange(dout_i, 's b h d -> b s h d')
++            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)]
++            b_, s_, g_, topk_ = zz_indices_i.shape
++            zz_indices_i = zz_indices_i.flatten().view(b_, s_, g_, topk_)
  
              # Backward pass
 -            dq_i, _dk_i, _dv_i, _ = eager_attn_bwd(
 -                q_i, k_i, v_i, attn_bias, None, ctx.scale, ctx.dropout, outs[i], probs[i], dout_i
-+            dq_i, _dkv_i, _ = eager_attn_bwd(
-+                q_i, kv_i, attn_bias, None, ctx.scale, dim_short, ctx.dropout, outs[i], probs[i], dout_i
-             )
- 
+-            )
+-
++            # TODO: needs casual = True, may not be compatible with zz
++            dq_i, _dkv_i = sparse_mla_bwd(q_i.contiguous(), kv_i, outs[i], dout_i.contiguous(), zz_indices_i, dim_v, lses[i], softmax_scale, True)
++            
              # Rearrange gradients to (s, b, h, d)
              dq_i = einops.rearrange(dq_i, 'b s h d -> s b h d')
 -            _dk_i = einops.rearrange(_dk_i, 'b s h d -> s b h d')
 -            _dv_i = einops.rearrange(_dv_i, 'b s h d -> s b h d')
 +            _dkv_i = einops.rearrange(_dkv_i, 'b s h d -> s b h d')
-+
              if pg is None:
 -                dk_i = _dk_i
 -                dv_i = _dv_i
@@ -289,9 +407,9 @@ index 89659a1d7..77f1beb87 100644
 -        dv = torch.cat(dv, dim=2)
 -        return dq, dk, dv, None, None, None, None
 +        dkv = torch.cat(dkv, dim=2)
-+        return dq, dkv, dkv[:,:,:,:dim_short].detach().contiguous(), None, None, None, None, None
++        return dq, dkv, dkv[:,:,:,:dim_v].detach().contiguous(), None, None, None, None, None, None
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
-index fc994490b..7bc9a485e 100644
+index fc994490b..487d147a8 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
 @@ -6,6 +6,7 @@ from dataclasses import dataclass
@@ -506,7 +624,7 @@ index fc994490b..7bc9a485e 100644
          # [batch, seqlen, index_topk]
          topk_indices = index_scores.topk(topk_k, dim=-1)[1]
  
-@@ -687,6 +780,57 @@ def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
+@@ -687,6 +780,61 @@ def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
      output = output.reshape(sq, b, np * hnv)
      return output
  
@@ -555,16 +673,20 @@ index fc994490b..7bc9a485e 100644
 +   
 +    combined_mask = sparse_mask | causal_mask.unsqueeze(0)
 +
++    topk = topk_indices.size(-1)
 +    attention_mask_for_cp = combined_mask.unsqueeze(1)  # [b, 1, sq, skv_global]
++    keep_score = (~attention_mask_for_cp).to(torch.int32)
++    false_idx = keep_score.topk(k=topk, dim=-1, largest=True, sorted=False).indices.to(torch.int32).contiguous() # [b, 1, sq, skv_global]
++    false_idx = false_idx.expand(-1, key.shape[2], -1, -1).contiguous()
 +    output = AttentionFuncionWithContextParallel.apply(
-+        query, key, value, attention_mask_for_cp, 0.0, softmax_scale, pg, True
++        query, key, value, false_idx, value.shape[3], topk, 0.0, softmax_scale, pg
 +    )
 +    return output.reshape(sq, b, np * hnv)
 +
  
  class DSAttention(MegatronModule):
      """
-@@ -768,18 +912,17 @@ class DSAttention(MegatronModule):
+@@ -768,18 +916,17 @@ class DSAttention(MegatronModule):
              # Generate upper triangular mask with -inf above diagonal, 0 elsewhere
              # torch.triu with diagonal=1 creates upper triangular matrix (excluding main diagonal)
              # float_mask [sq, skv]
@@ -591,7 +713,7 @@ index fc994490b..7bc9a485e 100644
  
          # ===================================
          # Get index scores and top-k indices
-@@ -791,7 +934,7 @@ class DSAttention(MegatronModule):
+@@ -791,7 +938,7 @@ class DSAttention(MegatronModule):
          # ===================================
          # Run sparse attention kernel
          # ===================================
@@ -612,6 +734,486 @@ index 3953d933b..84301ed54 100644
  
  try:
      from einops import rearrange
+diff --git a/megatron/core/transformer/tilelang_kernel/__init__.py b/megatron/core/transformer/tilelang_kernel/__init__.py
+new file mode 100644
+index 000000000..d8f2425f0
+--- /dev/null
++++ b/megatron/core/transformer/tilelang_kernel/__init__.py
+@@ -0,0 +1,10 @@
++# Code is adopted from tilelang/examples/deepseek_v32
++# transformer/tilelang_kernel/__init__.py
++
++from .sparse_mla_fwd import sparse_mla_fwd_interface
++from .sparse_mla_bwd import sparse_mla_bwd
++
++__all__ = [
++    "sparse_mla_fwd_interface",
++    "sparse_mla_bwd",
++]
+diff --git a/megatron/core/transformer/tilelang_kernel/sparse_mla_bwd.py b/megatron/core/transformer/tilelang_kernel/sparse_mla_bwd.py
+new file mode 100644
+index 000000000..75b34d661
+--- /dev/null
++++ b/megatron/core/transformer/tilelang_kernel/sparse_mla_bwd.py
+@@ -0,0 +1,269 @@
++# Code is adopted from tilelang/examples/deepseek_v32
++# ruff: noqa
++import tilelang
++from tilelang import language as T
++import torch
++
++@tilelang.jit(out_idx=[-1])
++def preprocess(
++    B,
++    S,
++    H,
++    D,
++    block_ND=32,
++    num_stages=5,
++    dtype=T.bfloat16,
++    accum_dtype=T.float32,
++):
++    assert dtype == T.bfloat16
++    assert accum_dtype == T.float32
++    shape = [B, S, H, D]
++
++    @T.prim_func
++    def preprocess_kernel(
++        O: T.Tensor(shape, dtype),
++        dO: T.Tensor(shape, dtype),
++        Delta: T.Tensor([B, S, H], accum_dtype),
++    ):
++        with T.Kernel(H, T.ceildiv(S, block_ND), B) as (bx, by, bz):
++            o = T.alloc_fragment([block_ND, block_ND], accum_dtype)
++            do = T.alloc_fragment([block_ND, block_ND], accum_dtype)
++            delta = T.alloc_fragment([block_ND], accum_dtype)
++            acc = T.alloc_fragment([block_ND, block_ND], accum_dtype)
++            T.clear(acc)
++            for k in T.Pipelined(T.ceildiv(D, block_ND), num_stages=num_stages):
++                T.copy(O[bz, by * block_ND : (by + 1) * block_ND, bx, k * block_ND : (k + 1) * block_ND], o)
++                T.copy(dO[bz, by * block_ND : (by + 1) * block_ND, bx, k * block_ND : (k + 1) * block_ND], do)
++                for i, j in T.Parallel(block_ND, block_ND):
++                    acc[i, j] += o[i, j] * do[i, j]
++            T.reduce_sum(acc, delta, 1)
++            T.copy(delta, Delta[bz, by * block_ND : (by + 1) * block_ND, bx])
++
++    return preprocess_kernel
++
++
++@tilelang.jit(out_idx=[-1])
++def postprocess(
++    B,
++    S_kv,
++    D,
++    D_tail,
++    kv_group=1,
++    block_N=64,
++    threads=256,
++    dtype=T.bfloat16,
++    accum_dtype=T.float32,
++):
++    assert dtype == T.bfloat16
++    assert accum_dtype == T.float32
++    dkv_shape = [B, S_kv, kv_group, D + D_tail]
++
++    @T.prim_func
++    def postprocess_kernel(
++        dKV: T.Tensor(dkv_shape, accum_dtype),
++        dKV_out: T.Tensor(dkv_shape, dtype),
++    ):
++        with T.Kernel(T.ceildiv(S_kv, block_N), kv_group, B, threads=threads) as (bx, by, bz):
++            T.copy(
++                dKV[bz, bx * block_N : (bx + 1) * block_N, by, :],
++                dKV_out[bz, bx * block_N : (bx + 1) * block_N, by, :],
++            )
++
++    return postprocess_kernel
++
++
++@tilelang.jit(
++    out_idx=[-2],
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
++    },
++)
++def bwd(
++    B,
++    S,
++    S_kv,
++    H,
++    D,
++    D_tail,
++    topk,
++    kv_group=1,
++    sm_scale=None,
++    is_causal=True,
++    block_size=32,
++    num_stages=0,
++    threads=128,
++    indices_dtype=T.int32,
++    dtype=T.bfloat16,
++    accum_dtype=T.float32,
++):
++    assert is_causal == True, "non-casual is not supported now"
++    assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
++    assert dtype == T.bfloat16
++    assert accum_dtype == T.float32
++    assert indices_dtype == T.int32
++
++    if sm_scale is None:
++        sm_scale = (D + D_tail) ** (-0.5)
++    sm_scale_mul_reciprocal_log2 = sm_scale * 1.44269504  # log2(e)
++
++    H_kv = H // kv_group
++    q_shape = [B, S, H, D + D_tail]
++    k_shape = [B, S_kv, kv_group, D + D_tail]
++    o_shape = [B, S, H, D]
++    indices_shape = [B, S, kv_group, topk]
++    delta_shape = [B, S, H]
++    lse_shape = [B, S, H]
++    assert indices_dtype == T.int32
++    assert dtype == T.bfloat16
++    assert accum_dtype == T.float32
++
++    H = H_kv
++    padded_H = max(tilelang.math.next_power_of_2(H_kv), 16)
++    block_H = min(64, padded_H)
++    assert padded_H % block_H == 0
++    NH = padded_H // block_H
++    BS = block_size
++    NS = tilelang.cdiv(topk, block_size)
++
++    split_store = 2
++
++    @T.prim_func
++    def sparse_mla_bwd_kernel(
++        Q: T.Tensor(q_shape, dtype),
++        KV: T.Tensor(k_shape, dtype),
++        dO: T.Tensor(o_shape, dtype),
++        Indices: T.Tensor(indices_shape, indices_dtype),
++        Lse: T.Tensor(lse_shape, accum_dtype),
++        Delta: T.Tensor(delta_shape, accum_dtype),
++        dQ: T.Tensor(q_shape, dtype),
++        dKV: T.Tensor(k_shape, accum_dtype),
++    ):
++        with T.Kernel(S, B, kv_group * NH, threads=threads) as (s_i, by, bz):
++            Q_shared = T.alloc_shared([block_H, D], dtype)
++            Q_tail_shared = T.alloc_shared([block_H, D_tail], dtype)
++            KV_shared = T.alloc_shared([BS, D], dtype)
++            KV_tail_shared = T.alloc_shared([BS, D_tail], dtype)
++            dO_shared = T.alloc_shared([block_H, D], dtype)
++
++            P_shared_cast = T.alloc_shared([block_H, BS], dtype)
++            dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
++            dQ_shared = T.alloc_shared([block_H, D], dtype)
++            dQ_tail_shared = T.alloc_shared([block_H, D_tail], dtype)
++
++            acc_p = T.alloc_fragment([block_H, BS], accum_dtype)
++            acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
++            acc_dq = T.alloc_fragment([block_H, D], accum_dtype)
++            acc_dq_tail = T.alloc_fragment([block_H, D_tail], accum_dtype)
++            acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
++            acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
++            acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
++            acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
++
++            max_kv_i = s_i
++
++            T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, :D], Q_shared)
++            T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, D:], Q_tail_shared)
++            T.copy(dO[by, s_i, bz * block_H : (bz + 1) * block_H, :D], dO_shared)
++
++            T.clear(acc_dq)
++            T.clear(acc_dq_tail)
++
++            # Process each block of indices
++            for i_i in T.Pipelined(NS, num_stages=num_stages):
++                # Compute attention scores
++                for h_i, bi_i in T.Parallel(block_H, BS):
++                    acc_p[h_i, bi_i] = 0
++
++                # Load KV, V for this block of indices
++                for bi_i, d_i in T.Parallel(BS, D):
++                    KV_shared[bi_i, d_i] = KV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, d_i]
++
++                T.gemm(Q_shared, KV_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
++
++                for bi_i, d_i in T.Parallel(BS, D_tail):
++                    KV_tail_shared[bi_i, d_i] = KV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, D + d_i]
++                T.gemm(Q_tail_shared, KV_tail_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
++
++                for h_i, bi_i in T.Parallel(block_H, BS):
++                    acc_p[h_i, bi_i] = T.exp2(acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2 - Lse[by, s_i, bz * block_H + h_i])
++
++                T.copy(acc_p, P_shared_cast)
++
++                T.gemm(dO_shared, KV_shared, acc_dp, transpose_B=True, policy=T.GemmWarpPolicy.FullCol, clear_accum=True)
++
++                for h_i, bi_i in T.Parallel(block_H, BS):
++                    acc_dp[h_i, bi_i] = acc_p[h_i, bi_i] * (acc_dp[h_i, bi_i] - Delta[by, s_i, bz * block_H + h_i]) * sm_scale
++
++                T.copy(acc_dp, dP_shared_cast)
++                T.gemm(dP_shared_cast, KV_shared, acc_dq, policy=T.GemmWarpPolicy.FullCol)
++                T.gemm(dP_shared_cast, KV_tail_shared, acc_dq_tail, policy=T.GemmWarpPolicy.FullCol)
++
++                T.gemm(dP_shared_cast, Q_shared, acc_dkv, transpose_A=True, policy=T.GemmWarpPolicy.FullCol, clear_accum=True)
++                T.gemm(P_shared_cast, dO_shared, acc_dkv, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
++
++                T.clear(acc_dkv_tail)
++                T.gemm(dP_shared_cast, Q_tail_shared, acc_dkv_tail, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
++
++                for s in range(split_store):
++                    for bi_i, d_i in T.Parallel(BS, D):
++                        if bi_i < BS // split_store:
++                            acc_dkv_shared[bi_i, d_i] = acc_dkv[bi_i + s * (BS // split_store), d_i]
++
++                    for bi_i, d_i in T.Parallel(BS, D_tail):
++                        if bi_i < BS // split_store:
++                            acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
++
++                    for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
++                        T.atomic_addx4(
++                            dKV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)], bz // NH, d_i * 4],
++                            acc_dkv_shared[bi_i, d_i * 4],
++                        )
++
++                    # Atomically update dKV, dKV_tail tensors
++                    for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
++                        T.atomic_addx4(
++                            dKV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)], bz // NH, D + d_i * 4],
++                            acc_dkv_tail_shared[bi_i, d_i * 4],
++                        )
++
++            # Store the accumulated dQ
++            T.copy(acc_dq, dQ_shared)
++            T.copy(acc_dq_tail, dQ_tail_shared)
++
++            T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
++            T.copy(dQ_tail_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, D:])
++
++    return sparse_mla_bwd_kernel
++
++
++def sparse_mla_bwd(q, kv, o, do, indices, dim_v, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None):
++    assert q.is_contiguous()
++    assert kv.is_contiguous()
++    assert indices.is_contiguous()
++    assert lse.is_contiguous()
++    B, S, H, dim_plus_tail_dim = q.shape
++    _, S_kv, kv_group, _ = kv.shape
++    assert kv.shape[-1] == dim_plus_tail_dim
++    assert kv.shape[0] == B
++    # dim should be assigned
++    D = dim_v
++
++    D_tail = dim_plus_tail_dim - D
++    topk = indices.shape[-1]
++    assert indices.shape == (B, S, kv_group, topk)
++    assert lse.shape == (B, S, H)
++
++    # Get kernels
++    preprocess_kernel = preprocess(B, S, H, D)
++    bwd_kernel = bwd(B, S, S_kv, H, D, D_tail, topk, kv_group, sm_scale, is_casual)
++    postprocess_kernel = postprocess(B, S_kv, D, D_tail, kv_group)
++
++    if delta is None:
++        delta = preprocess_kernel(o, do)
++    dkv = torch.zeros_like(kv, dtype=torch.float32)
++    dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
++    dkv = postprocess_kernel(dkv)
++
++    return dq, dkv
+diff --git a/megatron/core/transformer/tilelang_kernel/sparse_mla_fwd.py b/megatron/core/transformer/tilelang_kernel/sparse_mla_fwd.py
+new file mode 100644
+index 000000000..382ca868f
+--- /dev/null
++++ b/megatron/core/transformer/tilelang_kernel/sparse_mla_fwd.py
+@@ -0,0 +1,183 @@
++# Code is adopted from tilelang/examples/deepseek_v32
++# ruff: noqa
++import torch
++import tilelang
++from tilelang import language as T
++
++@tilelang.jit(
++    out_idx=[-2, -1],
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    },
++)
++def sparse_mla_fwd(
++    heads,
++    dim,
++    tail_dim,
++    topk,
++    kv_group=1,
++    sm_scale=None,
++    is_causal=True,
++    CP0=True,
++    block_I=64,
++    num_stages=2,
++    threads=256,
++):
++    assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
++    assert tail_dim == tilelang.math.next_power_of_2(tail_dim), f"haven't check padding correctness yet, dim={tail_dim}"
++    assert is_causal == True, "non-casual is not supported"
++    assert topk % block_I == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
++    if sm_scale is None:
++        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
++    else:
++        sm_scale = sm_scale * 1.44269504  # log2(e)
++
++    batch = T.dynamic("batch")
++    seq_len = T.dynamic("seq_len")
++    seq_len_kv = T.dynamic("seq_len_kv")
++
++    head_kv = heads // kv_group
++    q_shape = [batch, seq_len, heads, dim + tail_dim]
++    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
++    o_shape = [batch, seq_len, heads, dim]
++    indices_shape = [batch, seq_len, kv_group, topk]
++    lse_shape = [batch, seq_len, heads]
++    indices_dtype = T.int32
++    dtype = T.bfloat16
++    accum_dtype = T.float32
++
++    G = kv_group
++    H = head_kv
++    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
++    if padded_H != H:
++        assert kv_group == 1, (
++            "here we solve the H padding automatically, other wise you should handle Q copy and Output copy with your mask (when kv_group == 1, use g_i * padded_H:(g_i+1) * padded_H would be handled automatically)"
++        )
++    BI = block_I
++    NI = tilelang.cdiv(topk, block_I)
++    D = dim
++    D_tail = tail_dim
++
++    if head_kv > 64:
++        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
++        REPLICATE_H = head_kv // 64
++    else:
++        REPLICATE_H = 1
++
++    H_per_block = padded_H if REPLICATE_H == 1 else 64
++
++    @T.prim_func
++    def main(
++        Q: T.Tensor(q_shape, dtype),  # type: ignore
++        KV: T.Tensor(kv_shape, dtype),  # type: ignore
++        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
++        Output: T.Tensor(o_shape, dtype),  # type: ignore
++        Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
++    ):
++        with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
++            bx,
++            by,
++            bz,
++        ):
++            Q_shared = T.alloc_shared([H_per_block, D], dtype)
++            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
++            KV_shared = T.alloc_shared([BI, D], dtype)
++            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
++            O_shared = T.alloc_shared([H_per_block, D], dtype)
++            Lse_shared = T.alloc_shared([H_per_block], accum_dtype)
++            mask = T.alloc_fragment([BI], "bool")
++
++            acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
++            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
++            S_shared = T.alloc_shared([H_per_block, BI], dtype)
++            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
++            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
++            alpha = T.alloc_fragment([H_per_block], accum_dtype)
++            m_i = T.alloc_fragment([H_per_block], accum_dtype)
++            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
++
++            T.fill(acc_o, 0)
++            T.fill(sumexp, 0)
++            T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
++
++            b_i, g_i = by, bz
++            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
++            q_i = s_i
++
++            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
++            H1 = H0 + H_per_block
++
++            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
++            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
++
++            for i_i in T.Pipelined(NI, num_stages=num_stages):
++                for bi_i, d_i in T.Parallel(BI, D):
++                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
++                for bi_i, d_i in T.Parallel(BI, D_tail):
++                    K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
++                for h_i, bi_i in T.Parallel(H_per_block, BI):
++                    acc_s[h_i, bi_i] = 0
++                T.gemm(
++                    Q_shared,
++                    KV_shared,
++                    acc_s,
++                    transpose_B=True,
++                    policy=T.GemmWarpPolicy.FullRow,
++                )
++                T.gemm(
++                    Q_tail_shared,
++                    K_tail_shared,
++                    acc_s,
++                    transpose_B=True,
++                    policy=T.GemmWarpPolicy.FullRow,
++                )
++                T.copy(m_i, m_i_prev)
++                T.reduce_max(acc_s, m_i, dim=1, clear=False)
++                for h_i in T.Parallel(H_per_block):
++                    m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
++                for h_i in T.Parallel(H_per_block):
++                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
++                for h_i, bi_i in T.Parallel(H_per_block, BI):
++                    acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
++                T.reduce_sum(acc_s, sumexp_i, dim=1)  # is this a accumulate operator?
++                for h_i in T.Parallel(H_per_block):
++                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
++                for h_i, d_i in T.Parallel(H_per_block, D):
++                    acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
++
++                T.copy(acc_s, S_shared)
++                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
++
++            # Rescale
++            for h_i, d_i in T.Parallel(H_per_block, D):
++                acc_o[h_i, d_i] /= sumexp[h_i]
++            for h_i in T.Parallel(H_per_block):
++                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
++
++            T.copy(acc_o, O_shared)
++            T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
++            T.copy(sumexp, Lse_shared)
++            T.copy(sumexp, Lse[b_i, s_i, H0:H1])
++
++    return main
++
++
++def sparse_mla_fwd_interface(q, kv, indices, d_v, sm_scale=None, return_p_sum: bool = False, block_I=64, num_stages=2, threads=256):
++    is_casual = True
++    assert return_p_sum == False, "This kernel file is for fwd only"
++    assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
++    batch, seq_len, heads, dim_plus_tail_dim = q.shape
++    _, seq_len_kv, kv_group, _ = kv.shape
++
++    assert kv.shape[-1] == dim_plus_tail_dim
++    tail_dim = dim_plus_tail_dim - d_v
++    assert kv.shape[0] == batch
++    _, _, _, topk = indices.shape
++    assert indices.shape == (batch, seq_len, kv_group, topk)
++
++    kernel = sparse_mla_fwd(
++        heads, d_v, tail_dim, topk, kv_group, sm_scale, is_casual, block_I=block_I, num_stages=num_stages, threads=threads
++    )
++    out, lse = kernel(q, kv, indices)
++    return out, lse
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
 index a3a167549..98391fda6 100644
 --- a/megatron/core/transformer/transformer_config.py
