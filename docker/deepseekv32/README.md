@@ -2,13 +2,13 @@
 
 ### Docker
 ```bash
-docker pull yueming11/miles:dsv32-dev
+docker pull yuemingy/miles:dsv32-tilelang
 
-docker run --gpus all --ipc=host --shm-size=16g   --ulimit memlock=-1 --ulimit stack=67108864 --name miles_dsv32 yueming11/miles:dsv32-dev /bin/zsh
+docker run -it --gpus all --ipc=host --shm-size=16g --ulimit memlock=-1 --ulimit stack=67108864 --name miles_dsv32_tilelang yuemingy/miles:dsv32-tilelang /bin/zsh
 
-git clone https://github.com/radixark/miles.git
-git checkout dsv32
-cd dsv32
+git clone https://github.com/xiuhu17/miles
+cd miles
+git checkout tilelang
 pip install -e .
 
 # if shows Megatron does not support numpy 2.x
