@@ -1,5 +1,5 @@
 diff --git a/megatron/core/transformer/dot_product_attention_context_parallel.py b/megatron/core/transformer/dot_product_attention_context_parallel.py
-index 89659a1d7..4248e2bea 100644
+index 89659a1d7..b9bd38718 100644
 --- a/megatron/core/transformer/dot_product_attention_context_parallel.py
 +++ b/megatron/core/transformer/dot_product_attention_context_parallel.py
 @@ -3,9 +3,12 @@
@@ -112,7 +112,7 @@ index 89659a1d7..4248e2bea 100644
  class AllGatherComm:
      """All gather communication with async operations"""
  
-@@ -131,27 +44,16 @@ class AllGatherComm:
+@@ -131,27 +44,17 @@ class AllGatherComm:
                  handle.wait()
              self.handles = []
  
@@ -140,13 +140,14 @@ index 89659a1d7..4248e2bea 100644
 +    #   k: [seq_len_kv_shard, batch, kv_group, dim + tail_dim]
 +    #   v: [seq_len_kv_shard, batch, kv_group, dim]
 +    # indices: [batch, kv_group, seq_len, topk]
++    # masks: [batch, kv_group, seq_len, seq_len_kv]
      @staticmethod
 -    def forward(ctx, q, k, v, attention_mask, attention_dropout, softmax_scale, pg):
-+    def forward(ctx, q, kv, v, indices, dim_v, K, attention_dropout, softmax_scale, pg):
++    def forward(ctx, q, kv, v, indices, masks, dim_v, K, attention_dropout, softmax_scale, pg):
          '''Forward pass for the native attention function with context parallelism'''
  
          # Assert einops exists
-@@ -164,72 +66,71 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+@@ -164,72 +67,75 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
              cp_size = torch.distributed.get_world_size(pg)
          comm = AllGatherComm(group=pg)
          nheads = q.shape[2]
@@ -189,6 +190,7 @@ index 89659a1d7..4248e2bea 100644
 +
 +        # Prepare topk
 +        zz_indices = indices.transpose(1, 2)
++        zz_masks = masks.transpose(1, 2)
 +        
 +        # Iterate over heads, sequential, i
 +        for i in range(0, kv_group, heads_kv_stride):
@@ -225,6 +227,9 @@ index 89659a1d7..4248e2bea 100644
 +            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)]
 +            b_, s_, g_, topk_ = zz_indices_i.shape
 +            zz_indices_i = zz_indices_i.flatten().view(b_, s_, g_, topk_)
++            zz_masks_i =  zz_masks[:, :, i:(i+heads_kv_stride)]
++            b_, s_, g_, skv_ = zz_masks_i.shape
++            zz_masks_i = zz_masks_i.flatten().view(b_, s_, g_, skv_)
  
              # Forward pass
 -            out_i, probs_i = eager_attn_fwd(
@@ -232,7 +237,7 @@ index 89659a1d7..4248e2bea 100644
 -            )
 -            outs.append(out_i)
 -            probs.append(probs_i)
-+            out_i, lse_i = sparse_mla_fwd_interface(q_i.contiguous(), kv_i, zz_indices_i, dim_v, sm_scale = softmax_scale)
++            out_i, lse_i = sparse_mla_fwd_interface(q_i.contiguous(), kv_i, zz_indices_i, zz_masks_i, dim_v, sm_scale = softmax_scale)
 +
 +            outs.append(out_i.contiguous())
 +            lses.append(lse_i.contiguous())
@@ -246,7 +251,7 @@ index 89659a1d7..4248e2bea 100644
 -        ctx.save_for_backward(q, k, v, attention_mask, *outs, *probs)
 +        # outs: [[B, seq_len_shard, nheads // kv_group, dim], ...., [B, seq_len_shard, nheads // kv_group, dim]], repeat kv_group // heads_kv_stride times
 +        # lses: [[B, seq_len_shard, heads_kv_stride], ...., [B, seq_len_shard, heads_kv_stride]], repeat kv_group // heads_kv_stride times
-+        ctx.save_for_backward(q, kv, indices, *outs, *lses)
++        ctx.save_for_backward(q, kv, indices, masks, *outs, *lses)
 +        ctx.K = K
          ctx.dropout = attention_dropout
 -        ctx.scale = softmax_scale
@@ -258,12 +263,12 @@ index 89659a1d7..4248e2bea 100644
  
          return out
  
-@@ -238,13 +139,18 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+@@ -238,13 +144,18 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
          '''Backward pass for the native attention function with context parallelism'''
  
          # Initialize or resume constants and communication group
 -        q, k, v, attention_mask, *rest = ctx.saved_tensors
-+        q, kv, indices, *rest = ctx.saved_tensors
++        q, kv, indices, masks, *rest = ctx.saved_tensors
 +        K = ctx.K
 +        dim_v = ctx.dim_v
          nheads = q.shape[2]
@@ -283,7 +288,7 @@ index 89659a1d7..4248e2bea 100644
          pg = ctx.pg
          cp_size = 1
          if pg is not None:
-@@ -253,30 +159,25 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+@@ -253,30 +164,26 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
  
          # Initialize KV buffers
          kv_buffer = torch.empty(
@@ -315,6 +320,7 @@ index 89659a1d7..4248e2bea 100644
 +
 +        # Prepare topk
 +        zz_indices = indices.transpose(1, 2)
++        zz_masks = masks.transpose(1, 2)
  
          # Iterate over heads
 -        for i in range(0, nheads_k, heads_k_stride):
@@ -325,7 +331,7 @@ index 89659a1d7..4248e2bea 100644
              q_i = q[:, :, q_slice]
              dout_i = dout[:, :, q_slice]
  
-@@ -285,58 +186,47 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+@@ -285,58 +192,50 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
              kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
  
              # All-gather the next portion of KV buffers if not the last iteration
@@ -357,6 +363,9 @@ index 89659a1d7..4248e2bea 100644
 +            zz_indices_i = zz_indices[:, :, i:(i+heads_kv_stride)]
 +            b_, s_, g_, topk_ = zz_indices_i.shape
 +            zz_indices_i = zz_indices_i.flatten().view(b_, s_, g_, topk_)
++            zz_masks_i =  zz_masks[:, :, i:(i+heads_kv_stride)]
++            b_, s_, g_, skv_ = zz_masks_i.shape
++            zz_masks_i = zz_masks_i.flatten().view(b_, s_, g_, skv_)
  
              # Backward pass
 -            dq_i, _dk_i, _dv_i, _ = eager_attn_bwd(
@@ -364,7 +373,7 @@ index 89659a1d7..4248e2bea 100644
 -            )
 -
 +            # TODO: needs casual = True, may not be compatible with zz
-+            dq_i, _dkv_i = sparse_mla_bwd(q_i.contiguous(), kv_i, outs[i], dout_i.contiguous(), zz_indices_i, dim_v, lses[i], softmax_scale, True)
++            dq_i, _dkv_i = sparse_mla_bwd(q_i.contiguous(), kv_i, outs[i], dout_i.contiguous(), zz_indices_i, zz_masks_i, lses[i], dim_v, softmax_scale, True)
 +            
              # Rearrange gradients to (s, b, h, d)
              dq_i = einops.rearrange(dq_i, 'b s h d -> s b h d')
@@ -407,9 +416,9 @@ index 89659a1d7..4248e2bea 100644
 -        dv = torch.cat(dv, dim=2)
 -        return dq, dk, dv, None, None, None, None
 +        dkv = torch.cat(dkv, dim=2)
-+        return dq, dkv, dkv[:,:,:,:dim_v].detach().contiguous(), None, None, None, None, None, None
++        return dq, dkv, dkv[:,:,:,:dim_v].detach().contiguous(), None, None, None, None, None, None, None
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
-index fc994490b..487d147a8 100644
+index fc994490b..c64fa7d4e 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
 @@ -6,6 +6,7 @@ from dataclasses import dataclass
@@ -624,7 +633,7 @@ index fc994490b..487d147a8 100644
          # [batch, seqlen, index_topk]
          topk_indices = index_scores.topk(topk_k, dim=-1)[1]
  
-@@ -687,6 +780,61 @@ def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
+@@ -687,6 +780,49 @@ def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
      output = output.reshape(sq, b, np * hnv)
      return output
  
@@ -657,36 +666,24 @@ index fc994490b..487d147a8 100644
 +
 +def unfused_dsa_fn_with_cp(query, key, value, topk_indices, softmax_scale):
 +    pg = parallel_state.get_context_parallel_group()
-+    cp_size = parallel_state.get_context_parallel_world_size()
-+    cp_rank = parallel_state.get_context_parallel_rank()
 +
 +    sq, b, np, hn = query.size()
 +    skv = key.size(0)
 +    hnv = value.size(3)
 +    
-+    skv_global = skv * cp_size
-+    
-+    sparse_mask = torch.ones((b, sq, skv_global), dtype=torch.bool, device=query.device)
-+    sparse_mask.scatter_(-1, topk_indices, False)
-+    
-+    causal_mask = get_causal_mask(sq, skv, query.device)
-+   
-+    combined_mask = sparse_mask | causal_mask.unsqueeze(0)
-+
-+    topk = topk_indices.size(-1)
-+    attention_mask_for_cp = combined_mask.unsqueeze(1)  # [b, 1, sq, skv_global]
-+    keep_score = (~attention_mask_for_cp).to(torch.int32)
-+    false_idx = keep_score.topk(k=topk, dim=-1, largest=True, sorted=False).indices.to(torch.int32).contiguous() # [b, 1, sq, skv_global]
-+    false_idx = false_idx.expand(-1, key.shape[2], -1, -1).contiguous()
++    topk = topk_indices.shape[-1]
++    topk_indices = topk_indices.expand(-1, key.shape[2], -1, -1).contiguous()
++    causal_masks = get_causal_mask(sq, skv, query.device)
++    casual_masks = causal_masks.expand(-1, key.shape[2], -1, -1).contiguous()
 +    output = AttentionFuncionWithContextParallel.apply(
-+        query, key, value, false_idx, value.shape[3], topk, 0.0, softmax_scale, pg
++        query, key, value, topk_indices, casual_masks, value.shape[3], topk, 0.0, softmax_scale, pg
 +    )
 +    return output.reshape(sq, b, np * hnv)
 +
  
  class DSAttention(MegatronModule):
      """
-@@ -768,18 +916,17 @@ class DSAttention(MegatronModule):
+@@ -768,18 +904,17 @@ class DSAttention(MegatronModule):
              # Generate upper triangular mask with -inf above diagonal, 0 elsewhere
              # torch.triu with diagonal=1 creates upper triangular matrix (excluding main diagonal)
              # float_mask [sq, skv]
@@ -713,7 +710,7 @@ index fc994490b..487d147a8 100644
  
          # ===================================
          # Get index scores and top-k indices
-@@ -791,7 +938,7 @@ class DSAttention(MegatronModule):
+@@ -791,7 +926,7 @@ class DSAttention(MegatronModule):
          # ===================================
          # Run sparse attention kernel
          # ===================================
@@ -752,10 +749,10 @@ index 000000000..d8f2425f0
 +]
 diff --git a/megatron/core/transformer/tilelang_kernel/sparse_mla_bwd.py b/megatron/core/transformer/tilelang_kernel/sparse_mla_bwd.py
 new file mode 100644
-index 000000000..75b34d661
+index 000000000..a0972a749
 --- /dev/null
 +++ b/megatron/core/transformer/tilelang_kernel/sparse_mla_bwd.py
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,274 @@
 +# Code is adopted from tilelang/examples/deepseek_v32
 +# ruff: noqa
 +import tilelang
@@ -855,6 +852,7 @@ index 000000000..75b34d661
 +    indices_dtype=T.int32,
 +    dtype=T.bfloat16,
 +    accum_dtype=T.float32,
++    masks_dtype=T.bool,
 +):
 +    assert is_causal == True, "non-casual is not supported now"
 +    assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -873,6 +871,7 @@ index 000000000..75b34d661
 +    indices_shape = [B, S, kv_group, topk]
 +    delta_shape = [B, S, H]
 +    lse_shape = [B, S, H]
++    masks_shape = [B, S, kv_group, S_kv]
 +    assert indices_dtype == T.int32
 +    assert dtype == T.bfloat16
 +    assert accum_dtype == T.float32
@@ -893,6 +892,7 @@ index 000000000..75b34d661
 +        KV: T.Tensor(k_shape, dtype),
 +        dO: T.Tensor(o_shape, dtype),
 +        Indices: T.Tensor(indices_shape, indices_dtype),
++        Masks: T.Tensor(masks_shape, masks_dtype),
 +        Lse: T.Tensor(lse_shape, accum_dtype),
 +        Delta: T.Tensor(delta_shape, accum_dtype),
 +        dQ: T.Tensor(q_shape, dtype),
@@ -902,8 +902,9 @@ index 000000000..75b34d661
 +            Q_shared = T.alloc_shared([block_H, D], dtype)
 +            Q_tail_shared = T.alloc_shared([block_H, D_tail], dtype)
 +            KV_shared = T.alloc_shared([BS, D], dtype)
-+            KV_tail_shared = T.alloc_shared([BS, D_tail], dtype)
++            KV_tail_shared = T.alloc_shared([BS, D_tail * 4], dtype)
 +            dO_shared = T.alloc_shared([block_H, D], dtype)
++            mask = T.alloc_fragment([BS], "bool")
 +
 +            P_shared_cast = T.alloc_shared([block_H, BS], dtype)
 +            dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
@@ -913,13 +914,11 @@ index 000000000..75b34d661
 +            acc_p = T.alloc_fragment([block_H, BS], accum_dtype)
 +            acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
 +            acc_dq = T.alloc_fragment([block_H, D], accum_dtype)
-+            acc_dq_tail = T.alloc_fragment([block_H, D_tail], accum_dtype)
++            acc_dq_tail = T.alloc_fragment([block_H, D_tail * 4], accum_dtype)
 +            acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
 +            acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
 +            acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
 +            acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
-+
-+            max_kv_i = s_i
 +
 +            T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, :D], Q_shared)
 +            T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, D:], Q_tail_shared)
@@ -931,8 +930,11 @@ index 000000000..75b34d661
 +            # Process each block of indices
 +            for i_i in T.Pipelined(NS, num_stages=num_stages):
 +                # Compute attention scores
++                for bi_i in T.Parallel(BS):
++                    mask[bi_i] = Masks[by, s_i, bz // NH, Indices[by, s_i, bz // NH, i_i * BS + bi_i]]
++
 +                for h_i, bi_i in T.Parallel(block_H, BS):
-+                    acc_p[h_i, bi_i] = 0
++                    acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], -T.infinity(acc_p.dtype), 0)
 +
 +                # Load KV, V for this block of indices
 +                for bi_i, d_i in T.Parallel(BS, D):
@@ -942,7 +944,7 @@ index 000000000..75b34d661
 +
 +                for bi_i, d_i in T.Parallel(BS, D_tail):
 +                    KV_tail_shared[bi_i, d_i] = KV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, D + d_i]
-+                T.gemm(Q_tail_shared, KV_tail_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
++                T.gemm(Q_tail_shared, KV_tail_shared[:, :D_tail], acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
 +
 +                for h_i, bi_i in T.Parallel(block_H, BS):
 +                    acc_p[h_i, bi_i] = T.exp2(acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2 - Lse[by, s_i, bz * block_H + h_i])
@@ -988,7 +990,7 @@ index 000000000..75b34d661
 +
 +            # Store the accumulated dQ
 +            T.copy(acc_dq, dQ_shared)
-+            T.copy(acc_dq_tail, dQ_tail_shared)
++            T.copy(acc_dq_tail[:, :D_tail], dQ_tail_shared)
 +
 +            T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
 +            T.copy(dQ_tail_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, D:])
@@ -996,7 +998,7 @@ index 000000000..75b34d661
 +    return sparse_mla_bwd_kernel
 +
 +
-+def sparse_mla_bwd(q, kv, o, do, indices, dim_v, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None):
++def sparse_mla_bwd(q, kv, o, do, indices, masks, lse, dim_v, sm_scale=None, is_casual=True, return_kernel=False, delta=None):
 +    assert q.is_contiguous()
 +    assert kv.is_contiguous()
 +    assert indices.is_contiguous()
@@ -1021,16 +1023,16 @@ index 000000000..75b34d661
 +    if delta is None:
 +        delta = preprocess_kernel(o, do)
 +    dkv = torch.zeros_like(kv, dtype=torch.float32)
-+    dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
++    dq = bwd_kernel(q, kv, do, indices, masks, lse, delta, dkv)
 +    dkv = postprocess_kernel(dkv)
 +
 +    return dq, dkv
 diff --git a/megatron/core/transformer/tilelang_kernel/sparse_mla_fwd.py b/megatron/core/transformer/tilelang_kernel/sparse_mla_fwd.py
 new file mode 100644
-index 000000000..382ca868f
+index 000000000..1f114117b
 --- /dev/null
 +++ b/megatron/core/transformer/tilelang_kernel/sparse_mla_fwd.py
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,190 @@
 +# Code is adopted from tilelang/examples/deepseek_v32
 +# ruff: noqa
 +import torch
@@ -1076,6 +1078,9 @@ index 000000000..382ca868f
 +    o_shape = [batch, seq_len, heads, dim]
 +    indices_shape = [batch, seq_len, kv_group, topk]
 +    lse_shape = [batch, seq_len, heads]
++    masks_shape = [batch, seq_len, kv_group, seq_len_kv]
++
++    masks_dtype = T.bool
 +    indices_dtype = T.int32
 +    dtype = T.bfloat16
 +    accum_dtype = T.float32
@@ -1105,6 +1110,7 @@ index 000000000..382ca868f
 +        Q: T.Tensor(q_shape, dtype),  # type: ignore
 +        KV: T.Tensor(kv_shape, dtype),  # type: ignore
 +        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
++        Masks: T.Tensor(masks_shape, masks_dtype), # type: ignore
 +        Output: T.Tensor(o_shape, dtype),  # type: ignore
 +        Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
 +    ):
@@ -1145,12 +1151,14 @@ index 000000000..382ca868f
 +            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
 +
 +            for i_i in T.Pipelined(NI, num_stages=num_stages):
++                for bi_i in T.Parallel(BI):
++                    mask[bi_i] = Masks[b_i, s_i, g_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i]]
 +                for bi_i, d_i in T.Parallel(BI, D):
 +                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
 +                for bi_i, d_i in T.Parallel(BI, D_tail):
 +                    K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
 +                for h_i, bi_i in T.Parallel(H_per_block, BI):
-+                    acc_s[h_i, bi_i] = 0
++                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], -T.infinity(acc_s.dtype), 0)
 +                T.gemm(
 +                    Q_shared,
 +                    KV_shared,
@@ -1196,7 +1204,7 @@ index 000000000..382ca868f
 +    return main
 +
 +
-+def sparse_mla_fwd_interface(q, kv, indices, d_v, sm_scale=None, return_p_sum: bool = False, block_I=64, num_stages=2, threads=256):
++def sparse_mla_fwd_interface(q, kv, indices, masks, d_v, sm_scale=None, return_p_sum: bool = False, block_I=64, num_stages=2, threads=256):
 +    is_casual = True
 +    assert return_p_sum == False, "This kernel file is for fwd only"
 +    assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
@@ -1208,11 +1216,12 @@ index 000000000..382ca868f
 +    assert kv.shape[0] == batch
 +    _, _, _, topk = indices.shape
 +    assert indices.shape == (batch, seq_len, kv_group, topk)
++    assert masks.shape == (batch, seq_len, kv_group, seq_len_kv)
 +
 +    kernel = sparse_mla_fwd(
 +        heads, d_v, tail_dim, topk, kv_group, sm_scale, is_casual, block_I=block_I, num_stages=num_stages, threads=threads
 +    )
-+    out, lse = kernel(q, kv, indices)
++    out, lse = kernel(q, kv, indices, masks)
 +    return out, lse
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
 index a3a167549..98391fda6 100644
