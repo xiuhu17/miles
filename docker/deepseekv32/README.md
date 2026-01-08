@@ -19,7 +19,7 @@ pip install numpy==1.26.4
 #### model download
 
 ```
-hf download Pinaster/DeepSeek-V3.2-5layer /root/models/DeepSeek-V3.2-5layer
+hf download Pinaster/DeepSeek-V3.2-5layer --local-dir /root/models/DeepSeek-V3.2-5layer
 ```
 
 #### Prepare model for training
