@@ -418,7 +418,7 @@ index 89659a1d7..b9bd38718 100644
 +        dkv = torch.cat(dkv, dim=2)
 +        return dq, dkv, dkv[:,:,:,:dim_v].detach().contiguous(), None, None, None, None, None, None, None
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
-index fc994490b..c64fa7d4e 100644
+index fc994490b..8570266a8 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
 @@ -6,6 +6,7 @@ from dataclasses import dataclass
@@ -633,7 +633,7 @@ index fc994490b..c64fa7d4e 100644
          # [batch, seqlen, index_topk]
          topk_indices = index_scores.topk(topk_k, dim=-1)[1]
  
-@@ -687,6 +780,49 @@ def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
+@@ -687,6 +780,51 @@ def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
      output = output.reshape(sq, b, np * hnv)
      return output
  
@@ -672,18 +672,20 @@ index fc994490b..c64fa7d4e 100644
 +    hnv = value.size(3)
 +    
 +    topk = topk_indices.shape[-1]
++    topk_indices = topk_indices.unsqueeze(1)
 +    topk_indices = topk_indices.expand(-1, key.shape[2], -1, -1).contiguous()
 +    causal_masks = get_causal_mask(sq, skv, query.device)
-+    casual_masks = causal_masks.expand(-1, key.shape[2], -1, -1).contiguous()
++    causal_masks = causal_masks[None, None, :, :]
++    causal_masks = causal_masks.expand(b, key.shape[2], -1, -1).contiguous()
 +    output = AttentionFuncionWithContextParallel.apply(
-+        query, key, value, topk_indices, casual_masks, value.shape[3], topk, 0.0, softmax_scale, pg
++        query, key, value, topk_indices, causal_masks, value.shape[3], topk, 0.0, softmax_scale, pg
 +    )
 +    return output.reshape(sq, b, np * hnv)
 +
  
  class DSAttention(MegatronModule):
      """
-@@ -768,18 +904,17 @@ class DSAttention(MegatronModule):
+@@ -768,18 +906,17 @@ class DSAttention(MegatronModule):
              # Generate upper triangular mask with -inf above diagonal, 0 elsewhere
              # torch.triu with diagonal=1 creates upper triangular matrix (excluding main diagonal)
              # float_mask [sq, skv]
@@ -710,7 +712,7 @@ index fc994490b..c64fa7d4e 100644
  
          # ===================================
          # Get index scores and top-k indices
-@@ -791,7 +926,7 @@ class DSAttention(MegatronModule):
+@@ -791,7 +928,7 @@ class DSAttention(MegatronModule):
          # ===================================
          # Run sparse attention kernel
          # ===================================
