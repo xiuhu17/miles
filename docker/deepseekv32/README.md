@@ -4,7 +4,7 @@
 ```bash
 docker pull yuemingy/miles:dsv32-tilelang
 
-docker run -it --gpus all --ipc=host --shm-size=16g --ulimit memlock=-1 --ulimit stack=67108864 -v /home/radixark/yueming:/workspace -v /data/yueming/models:/root/models -v /data/yueming/datasets:/root/datasets -e WANDB_KEY="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" --name miles_dsv32_tilelang yuemingy/miles:dsv32-tilelang /bin/zsh
+docker run -it --gpus all --ipc=host --shm-size=16g --ulimit memlock=-1 --ulimit stack=67108864 --name miles_dsv32_tilelang yuemingy/miles:dsv32-tilelang /bin/zsh
 
 git clone https://github.com/xiuhu17/miles
 cd miles
