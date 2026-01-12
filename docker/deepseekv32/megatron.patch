@@ -1,11 +1,8 @@
 diff --git a/megatron/core/transformer/dot_product_attention_context_parallel.py b/megatron/core/transformer/dot_product_attention_context_parallel.py
-index 89659a1d7..a36274bf2 100644
+index 89659a1d7..0078dfe36 100644
 --- a/megatron/core/transformer/dot_product_attention_context_parallel.py
 +++ b/megatron/core/transformer/dot_product_attention_context_parallel.py
-@@ -1,11 +1,15 @@
-+
- # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- 
+@@ -3,9 +3,12 @@
  # Some of this code was adopted from https://github.com/zhuzilin/ring-flash-attention/
  # This source code is licensed under the MIT license found in the
  # LICENSE file in the root directory of this source tree.
@@ -14,11 +11,11 @@ index 89659a1d7..a36274bf2 100644
  import torch
 +import torch.distributed as dist
  from torch.nn import functional as F
-+from .tilelang_kernel import sparse_mla_fwd_interface, sparse_mla_bwd
++from .tilelang_kernel import sparse_mla_bwd, sparse_mla_fwd_interface
  
  try:
      import einops
-@@ -15,96 +19,6 @@ except ImportError:
+@@ -15,96 +18,6 @@ except ImportError:
      HAVE_EINOPS = False
  
  
@@ -115,7 +112,7 @@ index 89659a1d7..a36274bf2 100644
  class AllGatherComm:
      """All gather communication with async operations"""
  
-@@ -131,104 +45,97 @@ class AllGatherComm:
+@@ -131,104 +44,97 @@ class AllGatherComm:
                  handle.wait()
              self.handles = []
  
@@ -285,7 +282,7 @@ index 89659a1d7..a36274bf2 100644
          ctx.pg = pg
  
          return out
-@@ -237,86 +144,99 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+@@ -237,86 +143,99 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
      def backward(ctx, dout):
          '''Backward pass for the native attention function with context parallelism'''
  
@@ -393,8 +390,6 @@ index 89659a1d7..a36274bf2 100644
 -            dq_i, _dk_i, _dv_i, _ = eager_attn_bwd(
 -                q_i, k_i, v_i, attn_bias, None, ctx.scale, ctx.dropout, outs[i], probs[i], dout_i
 -            )
--
--            # Rearrange gradients to (s, b, h, d)
 +                comm.all_gather(k_buffer_copy, send_k)
 +                comm.all_gather(v_buffer_copy, send_v)
 +
@@ -424,7 +419,8 @@ index 89659a1d7..a36274bf2 100644
 +
 +            # TODO: needs casual = True, may not be compatible with zz
 +            dq_i, _dk_i, _dv_i = sparse_mla_bwd(q_i, k_i, v_i, out_i, dout_i, zz_indices_i, zz_masks_i, lse_i, softmax_scale)
-+            
+ 
+-            # Rearrange gradients to (s, b, h, d)
              dq_i = einops.rearrange(dq_i, 'b s h d -> s b h d')
              _dk_i = einops.rearrange(_dk_i, 'b s h d -> s b h d')
              _dv_i = einops.rearrange(_dv_i, 'b s h d -> s b h d')
@@ -437,7 +433,7 @@ index 89659a1d7..a36274bf2 100644
                  dk_i = torch.zeros(
                      (k_i.shape[1] // cp_size, k_i.shape[0], k_i.shape[2], k_i.shape[3]),
                      device=k_i.device,
-@@ -330,13 +250,14 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
+@@ -330,13 +249,14 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
                  torch.distributed.reduce_scatter_tensor(dk_i, _dk_i, group=pg)
                  torch.distributed.reduce_scatter_tensor(dv_i, _dv_i, group=pg)
  
