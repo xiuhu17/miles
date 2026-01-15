@@ -16,18 +16,25 @@ pip install numpy==1.26.4
 ```
 
 ### File to replace
-File under the ```file_to_replace``` folder are the files used to replace in megatron. The dir are:
+File under the ```file_to_replace``` folder are the files used to replace in megatron. The target dir to replace is:
 
 ```Megatron-LM/megatron/core/transformer/experimental_attention_variant/dsa.py```
+
 ```Megatron-LM/megatron/core/transformer/tilelang_kernel/__init__.py```
+
 ```Megatron-LM/megatron/core/transformer/tilelang_kernel/sparse_mla_bwd.py```
+
 ```Megatron-LM/megatron/core/transformer/tilelang_kernel/sparse_mla_fwd.py```
+
 ```Megatron-LM/megatron/core/transformer/dot_product_attention_context_parallel.py```
+
 ```Megatron-LM/megatron/core/transformer/multi_latent_attention.py```
+
 ```Megatron-LM/megatron/core/transformer/transformer_config.py```
 
-### Torch Native Bwd for absorbption
-```absorbtion/bwd.py```
+### Torch Native Fwd, Bwd for absorbption
+For bwd, it is in: ```absorbtion/bwd.py```
+For fwd,  use v from k ```v = k[..., : dim_v]```
 
 
 ### Quick test with 5 layer model
