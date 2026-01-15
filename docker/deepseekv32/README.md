@@ -15,6 +15,21 @@ pip install -e .
 pip install numpy==1.26.4
 ```
 
+### File to replace
+File under the ```file_to_replace``` folder are the files used to replace in megatron. The dir are:
+
+```Megatron-LM/megatron/core/transformer/experimental_attention_variant/dsa.py```
+```Megatron-LM/megatron/core/transformer/tilelang_kernel/__init__.py```
+```Megatron-LM/megatron/core/transformer/tilelang_kernel/sparse_mla_bwd.py```
+```Megatron-LM/megatron/core/transformer/tilelang_kernel/sparse_mla_fwd.py```
+```Megatron-LM/megatron/core/transformer/dot_product_attention_context_parallel.py```
+```Megatron-LM/megatron/core/transformer/multi_latent_attention.py```
+```Megatron-LM/megatron/core/transformer/transformer_config.py```
+
+### Torch Native Bwd for absorbption
+```absorbtion/bwd.py```
+
+
 ### Quick test with 5 layer model
 #### model download
 
@@ -39,3 +54,7 @@ python scripts/run_deepseek_v32.py prepare-spmd --model-name DeepSeek-V3.2-5laye
 ```
 python scripts/run_deepseek_v32.py train --model-name DeepSeek-V3.2-5layer --megatron-model-type deepseek-v32-5layer
 ```
+
+
+
+
