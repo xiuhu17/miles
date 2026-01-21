@@ -263,12 +263,10 @@ def sparse_mla_bwd(q, kv, o, do, indices, masks, lse, dim_v, sm_scale=None, is_c
     # Get kernels
     preprocess_kernel = preprocess(B, S, H, D)
     bwd_kernel = bwd(B, S, S_kv, H, D, D_tail, topk, kv_group, sm_scale, is_casual)
-    postprocess_kernel = postprocess(B, S_kv, D, D_tail, kv_group)
 
     if delta is None:
         delta = preprocess_kernel(o, do)
     dkv = torch.zeros_like(kv, dtype=torch.float32)
     dq = bwd_kernel(q, kv, do, indices, masks, lse, delta, dkv)
-    dkv = postprocess_kernel(dkv)
 
     return dq, dkv
