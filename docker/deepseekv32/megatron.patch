@@ -427,7 +427,7 @@ index 89659a1d7..c69859a04 100644
 +        return dq, dk, None, None, None, None, None, None
 \ No newline at end of file
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
-index 353b31e9b..f5c55e429 100644
+index 353b31e9b..221e93500 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
 @@ -6,6 +6,7 @@ from dataclasses import dataclass
@@ -635,13 +635,13 @@ index 353b31e9b..f5c55e429 100644
 -            rotary_pos_emb = self.rotary_pos_emb(
 -                rotary_seq_len, packed_seq_params=packed_seq_params
 -            )
-+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
++            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq_params=packed_seq_params)
              mscale = 1.0
          else:
 -            rotary_pos_emb, mscale = self.rotary_pos_emb(
 -                rotary_seq_len, packed_seq_params=packed_seq_params
 -            )
-+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
++            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq_params=packed_seq_params)
  
          # =========================================
          # Gather inputs if sp is enabled
@@ -799,7 +799,7 @@ index 353b31e9b..f5c55e429 100644
 +        
          return output
 diff --git a/megatron/core/transformer/multi_latent_attention.py b/megatron/core/transformer/multi_latent_attention.py
-index ed90fdffa..4298e044b 100644
+index ed90fdffa..7a7597d66 100644
 --- a/megatron/core/transformer/multi_latent_attention.py
 +++ b/megatron/core/transformer/multi_latent_attention.py
 @@ -15,7 +15,7 @@ except ImportError:
@@ -852,22 +852,17 @@ index ed90fdffa..4298e044b 100644
  
          inference_context = deprecate_inference_params(inference_context, inference_params)
  
-@@ -576,13 +584,11 @@ class MLASelfAttention(MultiLatentAttention):
+@@ -576,9 +584,7 @@ class MLASelfAttention(MultiLatentAttention):
          rotary_pos_sin = None
          packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
          if self.config.rope_type == "rope":
 -            rotary_pos_emb = self.rotary_pos_emb(
 -                rotary_seq_len, packed_seq_params=packed_seq_params
 -            )
-+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
++            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq_params=packed_seq_params)
          else:
              if self.config.apply_rope_fusion:
                  rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
--                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq_params=packed_seq_params
-+                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
-                 )
-                 rotary_pos_emb = None
-                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
 @@ -591,11 +597,9 @@ class MLASelfAttention(MultiLatentAttention):
                      and fused_apply_mla_rope_for_kv is not None
                  ), "Fused MLA RoPE apply is not imported successfully"
@@ -875,7 +870,7 @@ index ed90fdffa..4298e044b 100644
 -                rotary_pos_emb, mscale = self.rotary_pos_emb(
 -                    rotary_seq_len, packed_seq_params=packed_seq_params
 -                )
-+                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
++                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq_params=packed_seq_params)
  
 -        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
 +        if packed_seq_params is not None:
