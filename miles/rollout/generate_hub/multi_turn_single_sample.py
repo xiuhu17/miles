@@ -3,15 +3,18 @@ Simple multi-turn generation with tool calling.
 """
 
 import argparse
-import json
-import uuid
-
-from pydantic import TypeAdapter
-from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
-from miles.rollout.generate_hub.tool_call_utils import tokenize_tool_responses
+from miles.rollout.generate_hub.generate_endpoint_wrapper import (
+    compute_prompt_ids_from_sample,
+    compute_request_payload,
+    update_sample_from_response,
+)
+from miles.rollout.generate_hub.tool_call_utils import (
+    create_tool_call_parser,
+    execute_tool_calls,
+    update_sample_with_tool_responses,
+)
 from miles.utils.http_utils import post
 from miles.utils.misc import load_function
 from miles.utils.types import Sample
@@ -21,33 +24,24 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     args = input.args
     sample = input.sample
     tokenizer = input.state.tokenizer
-
-    assert not args.partial_rollout, "Partial rollout is not supported for " "this function at the moment."
+    assert not args.partial_rollout
 
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     execute_tool_function = load_function(args.generate_execute_tool_function_path)
 
     tool_specs = load_function(args.generate_tool_specs_path)
-    assert isinstance(tool_specs, list)
+    tool_call_parser = create_tool_call_parser(tool_specs, args.generate_tool_call_parser)
 
-    tool_call_parser = FunctionCallParser(
-        tools=(TypeAdapter(list[Tool]).validate_python(tool_specs)),
-        tool_call_parser=args.generate_tool_call_parser,
-    )
+    prompt_tokens_ids = compute_prompt_ids_from_sample(input.state, sample, tools=tool_specs)
 
-    prompt = sample.prompt
-    if not isinstance(prompt, str):
-        prompt = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True, tools=tool_specs)
-    prompt_tokens_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    sample.loss_mask = []
+    sample.tokens = prompt_tokens_ids.copy()
 
-    response = ""
-    response_token_ids = []
-    loss_masks = []
-
-    for turn in range(args.generate_max_turns):
+    for _turn in range(args.generate_max_turns):
+        # TODO handle separately
         # Check if total length exceeds max context length
-        total_length = len(prompt_tokens_ids) + len(response_token_ids)
+        total_length = len(sample.tokens)
         if args.rollout_max_context_len is not None:
             max_context_length = args.rollout_max_context_len
         else:
@@ -56,57 +50,23 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
             sample.status = Sample.Status.TRUNCATED
             break
 
-        # Use token IDs instead of text
-        current_token_ids = prompt_tokens_ids + response_token_ids
-        payload = {
-            "input_ids": current_token_ids,
-            "sampling_params": input.sampling_params,
-            "return_logprob": True,  # Request log probabilities for training
-        }
+        # ----------------------- Call inference endpoint -------------------------
 
+        payload = compute_request_payload(args, sample.tokens, input.sampling_params)
         output = await post(url, payload)
+        await update_sample_from_response(args, sample, payload=payload, output=output)
 
-        cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-        cur_response = output["text"]
-        cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-        if sample.rollout_log_probs is None:
-            sample.rollout_log_probs = []
-        sample.rollout_log_probs += cur_log_probs
-
-        response += cur_response
-        response_token_ids += cur_response_token_ids
-        loss_masks += [1] * len(cur_response_token_ids)
-
-        # Set status
-        sample.update_from_meta_info(args, output["meta_info"])
-
-        finish_reason_type = output["meta_info"]["finish_reason"]["type"]
-        if finish_reason_type in ("abort", "length"):
+        if output["meta_info"]["finish_reason"]["type"] in ("abort", "length"):
             break
 
-        _, parsed_tool_calls = tool_call_parser.parse_non_stream(cur_response)
-        if len(parsed_tool_calls) == 0:
+        # ----------------------- Execute tools -------------------------
+
+        _, tool_calls = tool_call_parser.parse_non_stream(output["text"])
+        if len(tool_calls) == 0:
             break
 
-        tool_messages = await _execute_tool_calls(parsed_tool_calls, execute_tool_function)
-
-        next_obs_tokens_ids: list[int] = tokenize_tool_responses(tool_messages, tokenizer=tokenizer)
-        # TODO is this ok?
-        response += tokenizer.decode(next_obs_tokens_ids)
-        response_token_ids += next_obs_tokens_ids
-        loss_masks += [0] * len(next_obs_tokens_ids)
-
-        sample.rollout_log_probs += [0.0] * len(next_obs_tokens_ids)
-
-        assert len(response_token_ids) == len(
-            sample.rollout_log_probs
-        ), f"Token/logp length mismatch at turn {turn}: {len(response_token_ids)} tokens vs {len(sample.rollout_log_probs)} logps"
-
-    # Set sample attributes
-    sample.tokens = prompt_tokens_ids + response_token_ids
-    sample.response_length = len(response_token_ids)
-    sample.response = response
-    sample.loss_mask = loss_masks
+        tool_messages = await execute_tool_calls(tool_calls, execute_tool_function)
+        update_sample_with_tool_responses(sample, tool_messages, tokenizer=tokenizer)
 
     return GenerateFnOutput(samples=sample)
 
@@ -119,21 +79,3 @@ def _add_arguments(parser: argparse.ArgumentParser):
 
 
 generate.add_arguments = _add_arguments
-
-
-async def _execute_tool_calls(parsed_tool_calls, execute_one) -> list[dict]:
-    tool_messages = []
-    for call in parsed_tool_calls:
-        params = json.loads(call.parameters) if call.parameters else {}
-        result = await execute_one(call.name, params)
-        assert isinstance(result, str)
-        tool_messages.append(
-            {
-                "role": "tool",
-                # src: serving_chat.py :: _process_tool_call_id
-                "tool_call_id": f"call_{uuid.uuid4().hex[:24]}",
-                "content": result,
-                "name": call.name,
-            }
-        )
-    return tool_messages

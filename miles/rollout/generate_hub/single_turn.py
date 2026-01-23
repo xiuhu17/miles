@@ -9,23 +9,34 @@ from miles.rollout.generate_hub.generate_endpoint_wrapper import (
     update_sample_from_response,
 )
 from miles.utils.http_utils import post
+from miles.utils.types import Sample
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     args = input.args
     sample = input.sample
-
+    sampling_params = input.sampling_params
+    assert sample.status in {Sample.Status.PENDING, Sample.Status.ABORTED}, f"{sample.status=}"
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
-    prompt_ids = await compute_prompt_ids_from_sample(input.state, sample)
-    payload, halt_status = await compute_request_payload(input.state, sample, prompt_ids, input.sampling_params)
+    prompt_ids = compute_prompt_ids_from_sample(input.state, sample)
 
-    if payload is None:
-        sample.status = halt_status
-        return GenerateFnOutput(samples=sample)
+    # Handle Partial Rollout resuming
+    if len(sample.response) > 0:
+        input_ids = sample.tokens
+        sampling_params["max_new_tokens"] -= len(sample.tokens) - len(prompt_ids)
 
+        assert sampling_params["max_new_tokens"] >= 0
+        if sampling_params["max_new_tokens"] == 0:
+            sample.status = Sample.Status.TRUNCATED
+            return GenerateFnOutput(samples=sample)
+    else:
+        input_ids = prompt_ids
+
+    payload = compute_request_payload(
+        args, input_ids=input_ids, sampling_params=sampling_params, multimodal_inputs=sample.multimodal_inputs
+    )
     output = await post(url, payload)
-
     await update_sample_from_response(args, sample, payload=payload, output=output)
 
     return GenerateFnOutput(samples=sample)
