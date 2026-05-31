@@ -213,3 +213,14 @@ class RolloutServer:
 
     async def check_weights(self, action: str):
         return await asyncio.gather(*[g.check_weights(action=action) for g in self.server_groups])
+
+    async def wait_all_engines_alive(self, timeout: float = 600):
+        # TODO: 600s default is hardcoded; make it configurable (e.g. via args) once we have a clearer
+        # picture of init/recovery upper bounds across model sizes
+        sleep_time = 2
+        for _ in range(int(timeout // sleep_time)):
+            if all(e.is_alive for g in self.server_groups for e in g.all_engines):
+                return
+            await asyncio.sleep(sleep_time)
+            logger.info("wait_all_engines_alive looping...")
+        raise TimeoutError(f"Timed out after {timeout}s waiting for engines to become ready")

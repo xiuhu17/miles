@@ -42,6 +42,10 @@ class ServerEngine:
     def is_allocated(self) -> bool:
         return isinstance(self._state, _StateAllocatedBase)
 
+    @property
+    def is_alive(self) -> bool:
+        return isinstance(self._state, _StateAllocatedAlive)
+
     # TODO: unify w/ trainer `change_state`
     def _change_state(
         self,
