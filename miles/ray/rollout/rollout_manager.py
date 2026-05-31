@@ -150,15 +150,15 @@ class RolloutManager:
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
-        data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        data, metadata, metrics = self._get_rollout_data(rollout_id=rollout_id)
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False)
         log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         data = convert_samples_to_train_data(
             self.args,
             data,
+            metadata=metadata,
             custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
             custom_reward_post_process_func=self.custom_reward_post_process_func,
-            dynamic_global_batch_size=getattr(self, "_dynamic_global_batch_size", None),
         )
         return split_train_data_by_dp(self.args, data, self.train_parallel_config["dp_size"])
 
@@ -243,6 +243,7 @@ class RolloutManager:
     def _get_rollout_data(self, rollout_id):
         if self.args.load_debug_rollout_data:
             data = load_debug_rollout_data(self.args, rollout_id=rollout_id)
+            metadata = {}  # save/load metadata into debug rollout data as well
             metrics = None
         else:
             if self.use_experimental_refactor:
@@ -253,6 +254,7 @@ class RolloutManager:
                 )
             metrics = data.metrics
             data = data.samples
+            metadata = {}
             # flatten the data if it is a list of lists
             while isinstance(data[0], list):
                 data = list(itertools.chain.from_iterable(data))
@@ -261,9 +263,9 @@ class RolloutManager:
                 global_batch_size = self.args.global_batch_size
                 if self.args.use_dynamic_global_batch_size:
                     logger.info(f"Collected {len(data)} samples from rollout to train with dynamic global batch size")
-                    # TODO: this is a temporary solution, we should directly save dynamic_global_batch_size to rollout data
-                    self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(len(data))
-                    global_batch_size = self._dynamic_global_batch_size
+                    dynamic_global_batch_size = self._compute_dynamic_global_batch_size(len(data))
+                    metadata["dynamic_global_batch_size"] = dynamic_global_batch_size
+                    global_batch_size = dynamic_global_batch_size
 
                 if len(data) % global_batch_size != 0:
                     trim_len = (len(data) // global_batch_size) * global_batch_size
@@ -274,7 +276,7 @@ class RolloutManager:
                     logger.info(f"trim number of samples from {origin_data_length} to {trim_len}")
                 logger.info(f"Final collected {len(data)} samples from rollout to train")
 
-        return data, metrics
+        return data, metadata, metrics
 
     def _compute_dynamic_global_batch_size(self, num_samples: int) -> int:
         """Calculate dynamic global_batch_size to ensure only one training step.

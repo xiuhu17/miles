@@ -1,3 +1,5 @@
+from typing import Any
+
 import ray
 import torch
 
@@ -9,9 +11,9 @@ from miles.utils.types import Sample
 def convert_samples_to_train_data(
     args,
     samples: list[Sample] | list[list[Sample]],
+    metadata: dict[str, Any],
     custom_convert_samples_to_train_data_func,
     custom_reward_post_process_func,
-    dynamic_global_batch_size,
 ):
     """
     Convert inference generated samples to training data.
@@ -80,11 +82,10 @@ def convert_samples_to_train_data(
     if "teacher_log_probs" in samples[0].__dict__:
         train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
-    # TODO this looks hacky, refactor it
-    # Pass dynamic global_batch_size to training side
-    assert args.use_dynamic_global_batch_size == (dynamic_global_batch_size is not None)
-    if dynamic_global_batch_size is not None:
-        train_data["dynamic_global_batch_size"] = dynamic_global_batch_size
+    x = metadata.get("dynamic_global_batch_size")
+    assert args.use_dynamic_global_batch_size == (x is not None)
+    if x is not None:
+        train_data["dynamic_global_batch_size"] = x
 
     return train_data
 
