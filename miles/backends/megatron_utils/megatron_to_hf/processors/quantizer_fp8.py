@@ -133,7 +133,13 @@ def _get_scale_format(args, name, weight_block_size):
         return None  # use default fp32 scale format
 
     if ".experts." not in name:
-        # Non-MoE linear weights: ue8m0 when deepgemm is enabled
+        # Non-MoE linear weights (incl. shared_experts): the engine requants to the
+        # ue8m0 deepgemm layout only when its dense fp8 GEMM actually runs deepgemm
+        # (sglang Fp8LinearMethod.process_weights_after_loading); flashinfer/cutlass/
+        # triton backends keep canonical fp32 scales.
+        dense_backend = getattr(args, "sglang_fp8_gemm_runner_backend", "auto")
+        if dense_backend not in ("auto", "deep_gemm"):
+            return None
         return "ue8m0"
 
     # MoE expert weights: only ue8m0 when runner is deep_gemm
