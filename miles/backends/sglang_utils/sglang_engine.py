@@ -84,6 +84,24 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
     }
 
     with requests.Session() as session:
+        if os.getenv("MILES_SKIP_SGLANG_STARTUP_PROBE") == "1":
+            while True:
+                try:
+                    response = session.get(f"{base_url}/health", headers=headers)
+                    if response.status_code == 200:
+                        logger.info(
+                            "Skipping SGLang startup health_generate/flush_cache "
+                            "because MILES_SKIP_SGLANG_STARTUP_PROBE=1"
+                        )
+                        return
+                except requests.RequestException:
+                    pass
+
+                if not is_process_alive():
+                    raise Exception("Server process terminated unexpectedly.")
+
+                time.sleep(2)
+
         while True:
             try:
                 response = session.get(f"{base_url}/health_generate", headers=headers)
@@ -96,6 +114,10 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
                 raise Exception("Server process terminated unexpectedly.")
 
             time.sleep(2)
+
+        if os.getenv("MILES_SKIP_SGLANG_STARTUP_FLUSH") == "1":
+            logger.info("Skipping SGLang startup flush_cache because MILES_SKIP_SGLANG_STARTUP_FLUSH=1")
+            return
 
         # use flush_cache to make sure the working queue is empty, so that we can do offload
         while True:

@@ -506,11 +506,15 @@ def _train(args: ScriptArgs):
         sglang_dp_size = sglang_world_size
         sglang_ep_size = sglang_world_size
         sglang_a2a_backend = None
-    # MXFP8 dense GEMM uses the cutlass backend (mirrors run_deepseek_v32.py).
+    # MXFP8 dense GEMM uses the cutlass backend and MoE uses the flashinfer
+    # trtllm-routed runner (HashTopK fuses the routed scaling factor into the
+    # topk weights to satisfy apply_routed_scaling_factor_on_output).
     sglang_fp8_gemm_backend = "flashinfer_cutlass" if args.recipe == "mxfp8" else "auto"
+    sglang_moe_runner_backend = "flashinfer_trtllm_routed" if args.recipe == "mxfp8" else "auto"
     sglang_args = (
         f"--rollout-num-gpus-per-engine {sglang_world_size} "
         f"--sglang-fp8-gemm-backend {sglang_fp8_gemm_backend} "
+        f"--sglang-moe-runner-backend {sglang_moe_runner_backend} "
         f"--sglang-tp-size {sglang_tp_size} "
         f"--sglang-dp-size {sglang_dp_size} "
         "--sglang-enable-dp-attention "
@@ -599,6 +603,10 @@ def _train(args: ScriptArgs):
             "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
             "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         }
+
+    if "--check-weight-update-equal" in args.extra_args:
+        extra_env_vars["MILES_SKIP_SGLANG_STARTUP_PROBE"] = "1"
+        extra_env_vars["MILES_SKIP_SGLANG_STARTUP_FLUSH"] = "1"
 
     match args.recipe:
         case "mxfp8":
