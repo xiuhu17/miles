@@ -176,9 +176,10 @@ class DistBucketedWeightUpdateMixin:
             if mode not in ("in_place"):
                 ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
 
-            # int4/fp4/mxfp8 pre_process: restore runtime kernel layouts to
-            # canonical load shapes before sending canonical HF tensors.
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors", "mxfp8"]:
+            # compressed-tensors pre_process: restore runtime kernel layouts to
+            # canonical load shapes before sending canonical HF tensors. (mxfp8
+            # restores in-load via the per-param FusedMoE weight_loader hook.)
+            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     rollout_engines=self.rollout_engines,
                     restore_weights_before_load=True,
