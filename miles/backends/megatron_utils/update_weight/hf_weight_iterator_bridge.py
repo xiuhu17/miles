@@ -1,8 +1,6 @@
 import dataclasses
-import re
 
 from miles.backends.megatron_utils.lora_utils import is_lora_weight_name
-from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils import megatron_bridge_utils
 from miles.utils.iter_utils import chunk_named_params_by_size
 
@@ -55,11 +53,6 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
     def _postprocess_and_quantize(self, named_weights, weight_type: str):
         for hf_param_name, weight, megatron_param_name in named_weights:
             hf_name = hf_param_name.replace(".base_layer.", ".")
-            hf_name = _maybe_globalize_expert_hf_name(
-                self.args,
-                hf_name=hf_name,
-                megatron_param_name=megatron_param_name,
-            )
             weight = postprocess_hf_param(
                 args=self.args,
                 megatron_param_name=megatron_param_name,
@@ -103,65 +96,3 @@ class _MapWithLen:
     def __iter__(self):
         for x in self.xs:
             yield self.fn(x)
-
-
-_GROUPED_EXPERT_RE = re.compile(r"(?:^|\.)mlp\.experts\.linear_fc[12]\.weight(?P<expert>\d+)$")
-_LOCAL_EXPERT_RE = re.compile(r"(?:^|\.)mlp\.experts\.local_experts\.(?P<expert>\d+)\.linear_fc[12]\.weight$")
-_HF_EXPERT_RE = re.compile(r"(?P<prefix>\.mlp\.experts\.)(?P<expert>\d+)(?P<suffix>\.)")
-
-
-def _maybe_globalize_expert_hf_name(args, hf_name: str, megatron_param_name: str) -> str:
-    """Convert Bridge-exported local expert ids to global HF expert ids.
-
-    In bridge mode the actor's weight backup keeps Megatron's local EP names so
-    ``AutoBridge.get_conversion_tasks`` can find the current local tensors. Some
-    bridge mappings also export those local expert ids in the HF name. SGLang's
-    loader, however, treats HF ``mlp.experts.{id}`` as global expert ids and maps
-    them back to local ids with its own EP rank. Offset only when the HF id still
-    matches the local Megatron id; if a bridge already emitted global ids, leave it
-    untouched.
-    """
-    local_expert = _extract_local_expert_id(megatron_param_name)
-    if local_expert is None:
-        return hf_name
-
-    try:
-        ep = get_parallel_state().ep
-        ep_rank = int(ep.rank)
-        ep_size = int(ep.size)
-    except Exception:
-        return hf_name
-
-    if ep_size <= 1:
-        return hf_name
-
-    num_experts = getattr(args, "num_experts", None)
-    if not num_experts:
-        return hf_name
-
-    expert_offset = ep_rank * int(num_experts) // ep_size
-    if expert_offset == 0:
-        return hf_name
-
-    match = _HF_EXPERT_RE.search(hf_name)
-    if match is None:
-        return hf_name
-
-    hf_expert = int(match.group("expert"))
-    if hf_expert != local_expert:
-        return hf_name
-
-    global_expert = hf_expert + expert_offset
-    return (
-        hf_name[: match.start("expert")]
-        + str(global_expert)
-        + hf_name[match.end("expert") :]
-    )
-
-
-def _extract_local_expert_id(megatron_param_name: str) -> int | None:
-    for pattern in (_GROUPED_EXPERT_RE, _LOCAL_EXPERT_RE):
-        match = pattern.search(megatron_param_name)
-        if match is not None:
-            return int(match.group("expert"))
-    return None
