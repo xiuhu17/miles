@@ -604,10 +604,6 @@ def _train(args: ScriptArgs):
             "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         }
 
-    if "--check-weight-update-equal" in args.extra_args:
-        extra_env_vars["MILES_SKIP_SGLANG_STARTUP_PROBE"] = "1"
-        extra_env_vars["MILES_SKIP_SGLANG_STARTUP_FLUSH"] = "1"
-
     match args.recipe:
         case "mxfp8":
             misc_args += "--transformer-impl transformer_engine " "--bf16 " "--fp8-format e4m3 " "--fp8-recipe mxfp8 "
