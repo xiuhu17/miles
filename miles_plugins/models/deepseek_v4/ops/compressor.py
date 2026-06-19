@@ -1,3 +1,5 @@
+import os
+
 import einops
 import torch
 import torch.nn as nn
@@ -6,7 +8,7 @@ from torch.nn import Linear
 
 from miles_plugins.models.deepseek_v4.ops.cp_utils import all_gather_cp, get_freqs_cis_for_cp
 from miles_plugins.models.deepseek_v4.ops.kernel.precision_aligned_ops import linear_bf16_fp32
-from miles_plugins.models.deepseek_v4.ops.qat import fp8_simulate_qat
+from miles_plugins.models.deepseek_v4.ops.qat import fp8_simulate_qat, mxfp4_simulate_qat
 from miles_plugins.models.deepseek_v4.ops.rope import apply_rotary_emb, wrapped_precompute_freqs_cis
 from miles_plugins.models.deepseek_v4.ops.utils import rotate_activation
 
@@ -77,6 +79,7 @@ class DeepSeekV4Compressor(nn.Module):
         self.rotate = rotate
         coff = 1 + self.overlap
         self.use_fp8_qat = config.fp8 is not None
+        self.use_mxfp4_qat = os.environ.get("USE_MXFP4_QAT", "0") == "1"
 
         self.cp_group = cp_group
         self.cp_size = cp_group.size() if cp_group is not None else 1
@@ -155,7 +158,9 @@ class DeepSeekV4Compressor(nn.Module):
 
         if self.rotate:
             kv = rotate_activation(kv)
-            if self.use_fp8_qat:
+            if self.use_mxfp4_qat:
+                kv = mxfp4_simulate_qat(kv, 32)
+            elif self.use_fp8_qat:
                 kv = fp8_simulate_qat(kv, 128)
         else:
             if self.use_fp8_qat:

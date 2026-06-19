@@ -121,10 +121,13 @@ class ScriptArgs(U.ExecuteTrainConfig):
     enable_r3: bool = True
     train_deterministic: bool = True
     # Precision recipe for BOTH trainer (Megatron/TE) and rollout (sglang checkpoint):
-    #   fp8   - blockwise FP8 128x128 (Hopper: fp32 scales; Blackwell: pow2 scales, MXFP8-emulated)
-    #   mxfp8 - MXFP8 1x32 ue8m0 (Blackwell only; rollout serves the BF16->MXFP8 converted ckpt)
-    #   bf16  - BF16 training; rollout serves the source FP8 checkpoint
-    recipe: Literal["fp8", "mxfp8", "bf16"] = "fp8"
+    #   fp8       - blockwise FP8 128x128 (Hopper: fp32 scales; Blackwell: pow2 scales, MXFP8-emulated)
+    #   mxfp8     - MXFP8 1x32 ue8m0 (Blackwell only; rollout serves the BF16->MXFP8 converted ckpt)
+    #   mxfp4_qat - MXFP4 QAT on top of blockwise FP8 (Blackwell only): sets USE_MXFP4_QAT=1 so the
+    #               model MXFP4 fake-quantizes the indexer q / compressor kv + casts index scores to
+    #               BF16, and MoE expert weights are MXFP4 fake-quantized before TE's FP8 cast.
+    #   bf16      - BF16 training; rollout serves the source FP8 checkpoint
+    recipe: Literal["fp8", "mxfp8", "bf16", "mxfp4_qat"] = "fp8"
     enable_mis: bool = False
 
     # pass any extra sglang/miles/megatron args through `--extra-args '--your-arg'`
@@ -138,7 +141,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
         if self.model_name in _PRO_MODEL_NAMES:
             self.enable_r3 = False
         if self.hardware in ("H100", "H200"):
-            assert self.recipe != "mxfp8", "MXFP8 is not supported on H100/H200 (no native MXFP8)"
+            assert self.recipe not in (
+                "mxfp8",
+                "mxfp4_qat",
+            ), "MXFP8 / MXFP4-QAT require Blackwell (no native MXFP4/MXFP8 on H100/H200)"
         assert self.rollout_num_nodes >= 0
         assert self.rollout_num_nodes < self.num_nodes
         self.colocate = self.rollout_num_nodes == 0
@@ -526,11 +532,17 @@ def _train(args: ScriptArgs):
         sglang_dp_size = sglang_world_size
         sglang_ep_size = sglang_world_size
         sglang_a2a_backend = None
-    # MXFP8 dense GEMM uses the cutlass backend and MoE uses the flashinfer
-    # trtllm-routed runner (HashTopK fuses the routed scaling factor into the
-    # topk weights to satisfy apply_routed_scaling_factor_on_output).
-    sglang_fp8_gemm_backend = "flashinfer_cutlass" if args.recipe == "mxfp8" else "auto"
-    sglang_moe_runner_backend = "flashinfer_trtllm_routed" if args.recipe == "mxfp8" else "auto"
+        
+    match args.recipe:
+        case "mxfp8":
+            sglang_fp8_gemm_backend = "flashinfer_cutlass"
+            sglang_moe_runner_backend = "flashinfer_trtllm_routed"
+        case "mxfp4_qat":
+            sglang_fp8_gemm_backend = "flashinfer_mxfp4"
+            sglang_moe_runner_backend = "auto"
+        case _:  # fp8 / bf16
+            sglang_fp8_gemm_backend = "auto"
+            sglang_moe_runner_backend = "auto"
     sglang_args = (
         f"--rollout-num-gpus-per-engine {sglang_world_size} "
         f"--sglang-fp8-gemm-backend {sglang_fp8_gemm_backend} "
@@ -656,6 +668,19 @@ def _train(args: ScriptArgs):
                 # into train actors; on Blackwell the TE blockwise recipe is emulated with
                 # MXFP8 and requires power-of-two scales, so force it back to 0 here.
                 misc_args += """--train-env-vars '{"NVTE_FP8_BLOCK_SCALING_FP32_SCALES":"0"}' """
+        case "mxfp4_qat":
+            # MXFP4 QAT builds on the blockwise FP8 (128x128) framework. USE_MXFP4_QAT=1
+            # turns on the in-model MXFP4 fake-quant (indexer q / compressor kv), the
+            # FP32->BF16 index-score cast, and the MoE expert-weight MXFP4 fake-quant in
+            # TE's _get_weight_tensors. Because FP4->FP8 is lossless, the existing
+            # blockwise FP8 GEMM runs unchanged. Blackwell-only (asserted above), so
+            # force power-of-two scales like the Blackwell fp8 path.
+            misc_args += (
+                "--transformer-impl transformer_engine " "--bf16 " "--fp8-format e4m3 " "--fp8-recipe blockwise "
+            )
+            misc_args += (
+                """--train-env-vars '{"USE_MXFP4_QAT":"1","NVTE_FP8_BLOCK_SCALING_FP32_SCALES":"0"}' """
+            )
         case "bf16":
             pass
 

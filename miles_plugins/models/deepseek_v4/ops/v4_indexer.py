@@ -1,3 +1,5 @@
+import os
+
 import einops
 import torch
 from megatron.core import parallel_state
@@ -13,7 +15,7 @@ from miles_plugins.models.deepseek_v4.ops.kernel.tilelang_indexer_fwd import (
     _make_causal_cu_seqlens,
     batched_indexer_fwd,
 )
-from miles_plugins.models.deepseek_v4.ops.qat import fp8_simulate_qat
+from miles_plugins.models.deepseek_v4.ops.qat import fp8_simulate_qat, mxfp4_simulate_qat
 from miles_plugins.models.deepseek_v4.ops.rope import apply_rotary_emb, wrapped_precompute_freqs_cis
 from miles_plugins.models.deepseek_v4.ops.utils import rotate_activation
 
@@ -32,6 +34,7 @@ class V4Indexer(MegatronModule):
         self.rope_head_dim = config.qk_pos_emb_head_dim
         self.compress_ratio = 4
         self.use_fp8_qat = config.fp8 is not None
+        self.use_mxfp4_qat = os.environ.get("USE_MXFP4_QAT", "0") == "1"
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
@@ -106,7 +109,9 @@ class V4Indexer(MegatronModule):
         q = einops.rearrange(q, "b s ... -> s b ...")
 
         q = rotate_activation(q)
-        if self.use_fp8_qat:
+        if self.use_mxfp4_qat:
+            q = mxfp4_simulate_qat(q, 32)
+        elif self.use_fp8_qat:
             q = fp8_simulate_qat(q, 128)
 
         k = self.compressor(x)
@@ -127,6 +132,10 @@ class V4Indexer(MegatronModule):
             cu_ks = cu_ks[cp_rank * seqlen : (cp_rank + 1) * seqlen]
             cu_ke = cu_ke[cp_rank * seqlen : (cp_rank + 1) * seqlen]
         index_scores = batched_indexer_fwd(q, k, weights.float(), cu_ks, cu_ke)
+        if self.use_mxfp4_qat:
+            # QAT: index scores are cast FP32 -> BF16 (and back) to match the
+            # BF16 top-k selector used at inference (~2x faster top-k).
+            index_scores = index_scores.to(torch.bfloat16).to(torch.float32)
 
         topk_count = min(self.index_topk, index_scores.size(-1))
         topk_indices = index_scores.topk(topk_count, dim=-1)[1]
