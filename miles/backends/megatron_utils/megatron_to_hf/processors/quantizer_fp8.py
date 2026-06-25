@@ -134,6 +134,9 @@ def _get_scale_format(args, name, weight_block_size):
 
     if ".experts." not in name:
         # Non-MoE linear weights: ue8m0 when deepgemm is enabled
+        dense_backend = getattr(args, "sglang_fp8_gemm_runner_backend", "auto")
+        if dense_backend not in ("auto", "deep_gemm"):
+            return None
         return "ue8m0"
 
     # MoE expert weights: only ue8m0 when runner is deep_gemm

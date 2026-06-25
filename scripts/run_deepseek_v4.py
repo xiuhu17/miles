@@ -56,7 +56,7 @@ _MEGATRON_MODEL_TYPE = {
 _PRO_MODEL_NAMES = ("DeepSeek-V4-Pro-FP8",)
 _BLACKWELL_HARDWARE = ("B200", "B300", "GB200", "GB300")
 
-_DSV4_MXFP8_TE_PRECISION_CONFIG = """
+_DSV4_TE_PRECISION_CONFIG = """
 configs:
   bf16:
     transformer_engine_config_type: "TEQuantizationParams"
@@ -619,15 +619,6 @@ def _train(args: ScriptArgs):
     match args.recipe:
         case "mxfp8":
             misc_args += "--transformer-impl transformer_engine " "--bf16 " "--fp8-format e4m3 " "--fp8-recipe mxfp8 "
-            # Keep the DSA indexer weights_proj (a TELinear) in BF16 on the trainer
-            # via the TE per-module override below. The mcore->hf weight update
-            # (quantizer_mxfp8) and the rollout checkpoint (convert_hf_to_mxfp8)
-            # already keep it BF16 by their default skip lists.
-            if "--te-precision-config-file" not in args.extra_args:
-                misc_args += (
-                    f"--te-precision-config-file "
-                    f"{U.save_to_temp_file(_DSV4_MXFP8_TE_PRECISION_CONFIG, 'yaml')} "
-                )
         case "fp8":
             misc_args += (
                 "--transformer-impl transformer_engine " "--bf16 " "--fp8-format e4m3 " "--fp8-recipe blockwise "
@@ -643,6 +634,12 @@ def _train(args: ScriptArgs):
                 misc_args += """--train-env-vars '{"NVTE_FP8_BLOCK_SCALING_FP32_SCALES":"0"}' """
         case "bf16":
             pass
+
+    if args.recipe in ("mxfp8", "fp8") and "--te-precision-config-file" not in args.extra_args:
+        misc_args += (
+            f"--te-precision-config-file "
+            f"{U.save_to_temp_file(_DSV4_TE_PRECISION_CONFIG, 'yaml')} "
+        )
 
     train_args = (
         f"{ckpt_args} "
