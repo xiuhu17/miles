@@ -56,10 +56,6 @@ _MEGATRON_MODEL_TYPE = {
 _PRO_MODEL_NAMES = ("DeepSeek-V4-Pro-FP8",)
 _BLACKWELL_HARDWARE = ("B200", "B300", "GB200", "GB300")
 
-# DeepSeek V4 DSA indexer weights_proj must stay BF16. On the trainer this is
-# enforced by the TE per-module override below; the mcore->hf weight update
-# (quantizer_mxfp8) and the rollout checkpoint (convert_hf_to_mxfp8
-# SKIP_WEIGHT_SUBSTRINGS) already keep it BF16 by default.
 _DSV4_MXFP8_TE_PRECISION_CONFIG = """
 configs:
   bf16:
