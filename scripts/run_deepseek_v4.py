@@ -579,9 +579,7 @@ def _train(args: ScriptArgs):
         # Keep the DSA indexer weights_proj (a TELinear) in BF16 on the trainer: blockwise
         # fp8 on weights_proj is numerically unstable, so override it back to BF16 via TE.
         if "--te-precision-config-file" not in args.extra_args:
-            misc_args += (
-                f"--te-precision-config-file " f"{U.save_to_temp_file(_DSV4_TE_PRECISION_CONFIG, 'yaml')} "
-            )
+            misc_args += f"--te-precision-config-file " f"{U.save_to_temp_file(_DSV4_TE_PRECISION_CONFIG, 'yaml')} "
 
     train_args = (
         f"{ckpt_args} "
