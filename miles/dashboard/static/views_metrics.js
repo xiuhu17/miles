@@ -1,6 +1,6 @@
 import { api } from "./api.js";
-import { el } from "./app.js";
-import { drawChart } from "./charts.js";
+import { el, setViewCleanup } from "./app.js";
+import { drawChart, drawMultiLine, SERIES_COLORS } from "./charts.js";
 
 // wandb-shaped L0: metric names come verbatim from the tracking fan-out, so
 // categories are simply the key prefixes. One category at a time (wandb
@@ -20,10 +20,13 @@ function axisOf(key) {
 
 function orderedCategories(meta) {
   const present = [...new Set(meta.metric_keys.map(categoryOf))];
-  return [
+  const cats = [
     ...CATEGORY_ORDER.filter((c) => present.includes(c)),
-    ...present.filter((c) => !CATEGORY_ORDER.includes(c)).sort(),
+    ...present.filter((c) => !CATEGORY_ORDER.includes(c) && c !== "dump").sort(),
   ];
+  // grafana-parity category: scraped engine metrics, x = wall clock
+  if (meta.engine_metric_keys?.length) cats.splice(cats.includes("dump") ? cats.length - 1 : cats.length, 0, "sglang");
+  return cats;
 }
 
 export async function renderMetrics(view, meta) {
@@ -60,17 +63,57 @@ export async function renderMetrics(view, meta) {
 
   const activeKeys = () => {
     const needle = filterInput.value.toLowerCase();
-    return meta.metric_keys.filter((k) => categoryOf(k) === active && k.toLowerCase().includes(needle));
+    const pool = active === "sglang" ? meta.engine_metric_keys : meta.metric_keys.filter((k) => categoryOf(k) === active);
+    return pool.filter((k) => k.toLowerCase().includes(needle));
   };
 
   // slots persist across refreshes; a chart repaints ONLY when its data
   // changed (signature check), so a live page sits visually still between
   // real updates instead of flickering on every poll
-  const slots = new Map(); // key -> {canvas, status, signature}
+  const slots = new Map(); // key -> {canvas, status, signature, lastSeries?}
   let epoch = 0;
+
+  // sglang legend: one checkbox per engine, all on by default; unchecking
+  // hides that engine's line in every chart (and drops it from the y-scale)
+  const engines = []; // sorted union of scraped addrs, fixes the color order page-wide
+  const hiddenEngines = new Set();
+  const legendPanel = el("div", { class: "panel", style: "flex: 0 0 240px; min-width: 240px; display: none" });
+  const engineOpts = () => ({ hidden: hiddenEngines, colorIndex: (label) => engines.indexOf(label) });
+  const redrawEngineCharts = () => {
+    for (const slot of slots.values()) {
+      if (slot.lastSeries) drawMultiLine(slot.canvas, slot.lastSeries, engineOpts());
+    }
+  };
+  const renderLegend = () => {
+    legendPanel.replaceChildren(
+      el("h3", {}, ["engines"]),
+      ...engines.map((addr, i) =>
+        el(
+          "label",
+          { style: "display: flex; align-items: center; gap: 6px; padding: 2px 0; cursor: pointer; font-size: 12px" },
+          [
+            el("input", {
+              type: "checkbox",
+              ...(hiddenEngines.has(addr) ? {} : { checked: "" }),
+              onchange: (ev) => {
+                if (ev.target.checked) hiddenEngines.delete(addr);
+                else hiddenEngines.add(addr);
+                redrawEngineCharts();
+              },
+            }),
+            el("span", {
+              style: `display: inline-block; width: 14px; height: 3px; background: ${SERIES_COLORS[i % SERIES_COLORS.length]}`,
+            }),
+            addr.replace(/^https?:\/\//, ""),
+          ],
+        ),
+      ),
+    );
+  };
 
   function buildPanels() {
     slots.clear();
+    legendPanel.style.display = active === "sglang" ? "" : "none";
     const keys = activeKeys();
     if (!keys.length) {
       chartsPanel.replaceChildren(el("p", { class: "muted" }, [active ? "no metrics here" : "no metrics logged"]));
@@ -89,6 +132,37 @@ export async function renderMetrics(view, meta) {
 
   function refresh() {
     const current = ++epoch;
+    if (active === "sglang") {
+      for (const [key, slot] of slots.entries()) {
+        api("/api/timeline/engine_series", { metric: key, max_points: 1000 })
+          .then(({ series }) => {
+            if (current !== epoch) return;
+            const signature = series.map((s) => `${s.addr}:${s.ts.length}:${s.ts.at(-1)}`).join("|");
+            if (signature === slot.signature) return;
+            slot.signature = signature;
+            slot.status.remove();
+            slot.lastSeries = series.map((s) => ({ label: s.addr, ts: s.ts, value: s.value }));
+            let grew = false;
+            for (const s of series) {
+              if (!engines.includes(s.addr)) {
+                engines.push(s.addr);
+                grew = true;
+              }
+            }
+            if (grew) {
+              engines.sort();
+              renderLegend();
+              redrawEngineCharts(); // sort may have shifted the color order
+            } else {
+              drawMultiLine(slot.canvas, slot.lastSeries, engineOpts());
+            }
+          })
+          .catch((err) => {
+            if (current === epoch && slot.signature === null) slot.status.textContent = String(err);
+          });
+      }
+      return;
+    }
     const byAxis = new Map();
     for (const key of slots.keys()) {
       const axis = axisOf(key);
@@ -133,8 +207,16 @@ export async function renderMetrics(view, meta) {
         catList,
       ]),
       chartsPanel,
+      legendPanel,
     ]),
   );
   renderCategories();
   buildPanels();
+
+  if (meta.mode === "follow") {
+    // refresh is fire-and-forget and idempotent: unchanged charts skip the
+    // repaint entirely, so the live page sits still between real updates
+    const intervalId = setInterval(refresh, 5000);
+    setViewCleanup(() => clearInterval(intervalId));
+  }
 }

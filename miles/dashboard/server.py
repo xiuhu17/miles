@@ -79,6 +79,7 @@ def make_app(store: MetricStore, reader: DumpReader, *, follow: bool = False) ->
             time_range=store.time_range(),
             rollout_ids=dict(train=ids.train, eval=ids.eval),
             metric_keys=store.metric_keys() + dump_keys,
+            engine_metric_keys=store.engine_metric_names(),
             step_keys=store.step_keys(),
             capabilities=dict(
                 has_metrics=bool(store.records[Stream.METRICS]),

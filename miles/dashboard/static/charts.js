@@ -287,3 +287,121 @@ export function divergingColor(t) {
 export function sequentialColor(t) {
   return `rgba(70, 194, 142, ${Math.min(1, Math.max(0, t)) * 0.85})`;
 }
+
+
+// fixed categorical order, assigned by sorted-series index (stable across
+// refreshes because the store sorts by addr); cycles past 10 series
+export const SERIES_COLORS = [
+  "#2f6feb", "#e8590c", "#12b886", "#d6336c", "#7048e8",
+  "#f59f00", "#0c8599", "#5c940d", "#a61e4d", "#495057",
+];
+
+// seriesList: [{label, ts: [], value: []}] — one thin line per engine on a
+// shared scale, one color per engine; hover names the engine
+export function drawMultiLine(canvas, seriesList, opts = {}) {
+  const zoom = canvas._zoom ?? null;
+  // opts.hidden: legend-unchecked engines render as empty (drop out of the
+  // y-scale too); opts.colorIndex(label) pins colors to a page-wide order
+  const shown = opts.hidden ? seriesList.map((s) => (opts.hidden.has(s.label) ? { ...s, ts: [], value: [] } : s)) : seriesList;
+  const visible = zoom?.x
+    ? shown.map((s) => {
+        const ts = [];
+        const value = [];
+        s.ts.forEach((t, i) => {
+          if (t >= zoom.x[0] && t <= zoom.x[1]) {
+            ts.push(t);
+            value.push(s.value[i]);
+          }
+        });
+        return { ...s, ts, value };
+      })
+    : shown;
+  const { ctx, width, height } = setupCanvas(canvas);
+  const css = getComputedStyle(document.documentElement);
+  const colText = css.getPropertyValue("--muted").trim();
+  const colBorder = css.getPropertyValue("--border").trim();
+  ctx.clearRect(0, 0, width, height);
+  const plotW = width - MARGIN.left - MARGIN.right;
+  const plotH = height - MARGIN.top - MARGIN.bottom;
+  ctx.font = "11px ui-monospace, monospace";
+
+  const alive = visible.filter((s) => s.ts.length);
+  if (!alive.length && !zoom) {
+    ctx.fillStyle = colText;
+    ctx.fillText("no data", MARGIN.left + plotW / 2 - 20, MARGIN.top + plotH / 2);
+    return;
+  }
+  // x origin stays the run-wide first sample so +m:ss labels keep meaning under zoom
+  const withData = seriesList.filter((s) => s.ts.length);
+  const x0 = withData.length ? Math.min(...withData.map((s) => s.ts[0])) : 0;
+  const [xMin, xMax] = zoom?.x ?? [x0, alive.length ? Math.max(...alive.map((s) => s.ts.at(-1))) : x0 + 1];
+  let yMin, yMax;
+  if (zoom?.y) {
+    [yMin, yMax] = zoom.y;
+  } else {
+    [yMin, yMax] = alive.length
+      ? [Math.min(...alive.map((s) => Math.min(...s.value))), Math.max(...alive.map((s) => Math.max(...s.value)))]
+      : [0, 1];
+  }
+  if (yMin === yMax) [yMin, yMax] = [yMin - 0.5, yMax + 0.5];
+  const X = (t) => MARGIN.left + ((t - xMin) / Math.max(xMax - xMin, 1e-9)) * plotW;
+  const Y = (v) => MARGIN.top + (1 - (v - yMin) / (yMax - yMin)) * plotH;
+
+  ctx.strokeStyle = colBorder;
+  ctx.fillStyle = colText;
+  for (const tick of niceTicks(yMin, yMax, 4)) {
+    ctx.beginPath();
+    ctx.moveTo(MARGIN.left, Y(tick));
+    ctx.lineTo(width - MARGIN.right, Y(tick));
+    ctx.stroke();
+    ctx.fillText(fmt(tick), 6, Y(tick) + 4);
+  }
+  for (const tick of niceTicks(xMin - x0, xMax - x0, 6)) {
+    const rel = Math.round(tick);
+    ctx.fillText(`+${Math.floor(rel / 60)}:${String(rel % 60).padStart(2, "0")}`, X(x0 + tick) - 12, height - 6);
+  }
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(MARGIN.left, MARGIN.top, plotW, plotH);
+  ctx.clip();
+  ctx.lineWidth = 1;
+  visible.forEach((s, i) => {
+    if (!s.ts.length) return;
+    // index in the page-wide engine order, not the surviving subset: color follows the engine
+    const idx = opts.colorIndex ? opts.colorIndex(s.label) : i;
+    ctx.strokeStyle = SERIES_COLORS[idx % SERIES_COLORS.length];
+    ctx.beginPath();
+    s.ts.forEach((t, j) => (j ? ctx.lineTo(X(t), Y(s.value[j])) : ctx.moveTo(X(t), Y(s.value[j]))));
+    ctx.stroke();
+  });
+  ctx.restore();
+
+  const hover = (ev) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = ev.clientX - rect.left;
+    const my = ev.clientY - rect.top;
+    let best = null;
+    for (const s of alive) {
+      for (let i = 0; i < s.ts.length; i++) {
+        const d = (X(s.ts[i]) - mx) ** 2 + (Y(s.value[i]) - my) ** 2;
+        if (!best || d < best.d) best = { d, s, i };
+      }
+    }
+    if (!best || best.d > 30 ** 2) {
+      hideTooltip();
+      return;
+    }
+    showTooltip(ev.clientX, ev.clientY, `${best.s.label}\n+${fmt(best.s.ts[best.i] - x0)}s = ${fmt(best.s.value[best.i])}`);
+  };
+  installDragZoom(canvas, {
+    plotLeft: MARGIN.left,
+    plotRight: width - MARGIN.right,
+    plotTop: MARGIN.top,
+    plotBottom: height - MARGIN.bottom,
+    invX: (px) => xMin + ((px - MARGIN.left) / plotW) * Math.max(xMax - xMin, 1e-9),
+    invY: (py) => yMax - ((py - MARGIN.top) / plotH) * (yMax - yMin),
+    redraw: () => drawMultiLine(canvas, seriesList, opts),
+    hover,
+  });
+}

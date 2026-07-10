@@ -1,6 +1,7 @@
 import { getMeta } from "./api.js";
 import { renderMetrics } from "./views_metrics.js";
 import { renderRollout } from "./views_rollout.js";
+import { renderTimeline } from "./views_timeline.js";
 import { renderTokens } from "./views_tokens.js";
 
 // tiny DOM builder: el("div", {class: "x", onclick: fn}, [children|strings])
@@ -14,6 +15,14 @@ export function el(tag, attrs = {}, children = []) {
     node.append(child);
   }
   return node;
+}
+
+// views with background work (follow-mode auto refresh) register a cleanup
+// here; render() runs it before switching views so intervals never leak
+let activeViewCleanup = null;
+
+export function setViewCleanup(cleanup) {
+  activeViewCleanup = cleanup;
 }
 
 export const fmtNum = (v) => {
@@ -30,6 +39,9 @@ function parseRoute() {
   const [path, query] = (location.hash.slice(1) || "/").split("?");
   const segments = path.split("/").filter(Boolean);
   const params = new URLSearchParams(query || "");
+  if (segments[0] === "timeline") {
+    return { view: "timeline" };
+  }
   if (segments[0] === "rollout" && segments.length >= 2) {
     const rolloutId = Number(segments[1]);
     const evaluation = params.get("eval") === "1";
@@ -44,6 +56,9 @@ function parseRoute() {
 function crumbs(route, meta) {
   const nav = (label, href, active) => el("a", { class: `nav${active ? " active" : ""}`, href }, [label]);
   const parts = [nav("Metrics", "#/", route.view === "metrics")];
+  if (meta.capabilities.has_timeline) {
+    parts.push(nav("Compute Utilization", "#/timeline", route.view === "timeline"));
+  }
   // the per-step data view is a top-level destination, not a hidden
   // click-through from chart points; land on the newest train step
   const latest = meta.rollout_ids.train.at(-1);
@@ -68,6 +83,10 @@ function crumbs(route, meta) {
 }
 
 async function render() {
+  if (activeViewCleanup) {
+    activeViewCleanup();
+    activeViewCleanup = null;
+  }
   const route = parseRoute();
   const view = document.getElementById("view");
   view.replaceChildren(el("p", { class: "muted" }, ["loading…"]));
@@ -77,6 +96,7 @@ async function render() {
     document.getElementById("runinfo").textContent =
       `${meta.run_name ?? "unnamed run"} · ${meta.mode}` + (meta.capabilities.has_metrics ? "" : " · dump-derived metrics");
     if (route.view === "metrics") await renderMetrics(view, meta);
+    else if (route.view === "timeline") await renderTimeline(view, meta);
     else if (route.view === "rollout") await renderRollout(view, meta, route);
     else await renderTokens(view, meta, route);
   } catch (err) {
