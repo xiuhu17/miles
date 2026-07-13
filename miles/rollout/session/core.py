@@ -167,6 +167,7 @@ class SessionCore:
     async def chat_completions(
         self, session_id: str, *, method: str, query: str, headers: dict, body: bytes
     ) -> Response:
+        request_timestamp = time.time()
         """Proxy a chat completion through the backend with TITO token tracking.
 
         Three phases around the per-session lock: (1) under the lock, parse the
@@ -284,6 +285,7 @@ class SessionCore:
 
             record = SessionRecord(
                 timestamp=time.time(),
+                request_timestamp=request_timestamp,
                 method=method,
                 path="/v1/chat/completions",
                 status_code=result["status_code"],
