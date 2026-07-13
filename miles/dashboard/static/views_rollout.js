@@ -9,12 +9,23 @@ const DEFAULT_COLUMNS = [
   "reward",
   "response_length",
   "truncated",
+  "versions",
+  "turns",
+  "tool_calls",
   "mean_abs_lp_diff",
   "mean_imp_ratio",
   "mean_entropy",
   "adv_mean",
   "non_generation_time",
 ];
+
+// staleness span rendered as one sortable-ish string column; mixed-version
+// samples are exactly what --use-tis corrects, so they must not blend in
+function versionSpan(row) {
+  if (row.weight_version === null || row.weight_version === undefined) return null;
+  const lo = row.weight_version_min;
+  return row.mixed_version ? `v${lo}–v${row.weight_version}` : `v${row.weight_version}`;
+}
 
 function sortableTable(rows, columns, { onRowClick, flagRow, sortState }) {
   const wrap = el("div", { class: "tablewrap" });
@@ -59,6 +70,7 @@ export async function renderRollout(view, meta, route) {
     api(`/api/rollout/${rolloutId}/groups`, { eval: evaluation }),
   ]);
   const rows = summary.rows;
+  for (const row of rows) row.versions = versionSpan(row);
   const rewardKey = evaluation ? "reward" : "raw_reward";
 
   // -------- header controls: prev/next step, train/eval toggle --------
@@ -97,6 +109,16 @@ export async function renderRollout(view, meta, route) {
     statBox("reward mean", mean(rewards)),
     statBox("truncated frac", mean(rows.map((r) => (r.truncated ? 1 : 0)))),
     statBox("zero-std groups", `${zeroStdGroups}/${groups.rows.length}`),
+    statBox("mixed-version frac", mean(rows.map((r) => (r.mixed_version === null ? null : +r.mixed_version)).filter((v) => v !== null))),
+    // staleness = trainer version at consume − generation version; the engine
+    // counter is 1 after the startup push and +1 per train step, so the
+    // trainer holds v(step+1) when consuming step N
+    statBox(
+      "avg staleness",
+      evaluation
+        ? null
+        : mean(rows.map((r) => (r.weight_version_min == null ? null : rolloutId + 1 - r.weight_version_min)).filter((v) => v !== null)),
+    ),
     statBox("mean |lp diff|", mean(rows.map((r) => r.mean_abs_lp_diff).filter((v) => v !== null))),
     statBox("mean entropy", mean(rows.map((r) => r.mean_entropy).filter((v) => v !== null))),
   ]);

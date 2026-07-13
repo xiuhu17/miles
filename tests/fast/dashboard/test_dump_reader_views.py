@@ -214,3 +214,18 @@ def test_summary_and_tokens_survive_dump_without_log_probs(tmp_path):
     assert df["mean_imp_ratio"].is_null().all()
     assert df["reward"].null_count() < df.height  # the rest of the summary is intact
     assert reader.step_aggregates().height >= 1  # the metrics page path
+def test_staleness_and_agentic_columns(reader):
+    import polars as pl
+
+    df = reader.summary(0)
+    agentic = df.filter(pl.col("sample_index") % 3 == 0)
+    plain = df.filter(pl.col("sample_index") % 3 != 0)
+    # dummy dump: every third sample is two-turn with mixed versions + one tool message
+    assert agentic["mixed_version"].all() and agentic["turns"].min() == 2
+    assert agentic["tool_calls"].min() == 1
+    assert not plain["mixed_version"].any() and plain["turns"].max() == 1
+    assert plain["tool_calls"].is_null().all()  # string prompts: nothing to count
+    assert (agentic["weight_version"].cast(pl.Int64) - agentic["weight_version_min"] == 1).all()
+
+    aggregates = reader.step_aggregates()
+    assert 0 < aggregates["mixed_version_frac"][0] < 1
