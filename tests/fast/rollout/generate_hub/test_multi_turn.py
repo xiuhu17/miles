@@ -272,6 +272,26 @@ class TestBasicMultiTurn:
 
 
 class TestExitConditions:
+    @pytest.mark.parametrize(
+        "generation_env",
+        [{"args_kwargs": {"extra_argv": ["--save-debug-trajectory-data", "/unused/{rollout_id}.jsonl"]}}],
+        indirect=True,
+    )
+    def test_conversation_metadata_records_turns(self, variant, generation_env):
+        if variant != "multi_turn_single_sample":
+            pytest.skip("conversation recording asserted once, on the engine multi-turn path")
+        generation_env.mock_server.process_fn = TwoTurnStub.process_fn
+
+        S = TwoTurnStub
+        result = _run_generate(variant, generation_env, make_sample(prompt=S.PROMPT))
+
+        messages = result.sample.metadata["messages"]
+        # prompt message + turn-1 assistant + its two tool results + turn-2 assistant
+        assert [m["role"] for m in messages] == ["user", "assistant", "tool", "tool", "assistant"]
+        assert messages[1]["content"] == S.FIRST_RESPONSE
+        assert {m["name"] for m in messages[2:4]} == {"get_year", "get_temperature"}
+        assert messages[4]["content"] == S.SECOND_RESPONSE
+
     def test_partial_rollout_not_supported(self, variant, generation_env):
         if is_agentic_variant(variant):
             pytest.skip("agentic_tool_call does not check partial_rollout flag")

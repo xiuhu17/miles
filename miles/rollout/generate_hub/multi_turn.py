@@ -39,6 +39,10 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
     multi_samples = []
 
+    # tool-call markup stays inline in the assistant text (what the model emitted)
+    record_trajectory = args.save_debug_trajectory_data is not None
+    trajectory = (list(sample.prompt) if isinstance(sample.prompt, list) else []) if record_trajectory else None
+
     # ----------------------- Initial prompts -------------------------
 
     prompt_tokens_ids = compute_prompt_ids_from_sample(input.state, sample, tools=tool_specs)
@@ -65,6 +69,9 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
             tokens = output.get("meta_info", {}).get("completion_tokens", "")
             sink.gen_span(sample, gen_t0, time.time(), turn=_turn + 1, detail=str(tokens))
         await update_sample_from_response(args, sample, payload=payload, output=output, update_loss_mask=True)
+        if record_trajectory:
+            trajectory.append({"role": "assistant", "content": output["text"]})
+            sample.metadata["messages"] = list(trajectory)  # snapshot: multi_samples deepcopies per turn
 
         if args.generate_multi_samples:
             multi_samples.append(deepcopy(sample))
@@ -83,6 +90,9 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         if sink is not None:
             sink.tool_span(sample, tool_t0, time.time(), turn=_turn + 1, detail=f"{len(tool_calls)} calls")
         update_sample_with_tool_responses(sample, tool_messages, tokenizer=tokenizer)
+        if record_trajectory:
+            trajectory.extend(tool_messages)
+            sample.metadata["messages"] = list(trajectory)
 
     return GenerateFnOutput(samples=multi_samples if args.generate_multi_samples else sample)
 

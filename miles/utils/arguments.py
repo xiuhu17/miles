@@ -1498,6 +1498,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--save-debug-trajectory-data",
+                type=str,
+                default=None,
+                help=(
+                    "Save per-sample role-tagged trajectory text (JSONL) next to the rollout "
+                    "dump. The file will be saved to `save_debug_trajectory_data.format(rollout_id)`."
+                ),
+            )
+            parser.add_argument(
                 "--load-debug-rollout-data",
                 type=str,
                 default=None,
@@ -2363,6 +2372,7 @@ def miles_validate_args(args):
     if args.dump_details is not None:
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
+        args.save_debug_trajectory_data = f"{args.dump_details}/trajectory/{{rollout_id}}.jsonl"
 
     if args.load_debug_rollout_data is not None:
         logger.info(

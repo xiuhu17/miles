@@ -129,6 +129,7 @@ def _make_args(dump_dir: Path, *, num_prompts: int, n_samples_per_prompt: int) -
     # attribute dependency in main code fails loudly here (drift detection).
     return Namespace(
         save_debug_rollout_data=f"{dump_dir}/rollout_data/{{rollout_id}}.pt",
+        save_debug_trajectory_data=f"{dump_dir}/trajectory/{{rollout_id}}.jsonl",
         save_debug_train_data=f"{dump_dir}/train_data/{{rollout_id}}_{{rank}}.pt",
         balance_data=True,
         use_dynamic_global_batch_size=False,
