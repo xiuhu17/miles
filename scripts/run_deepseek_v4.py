@@ -537,7 +537,10 @@ def _train(args: ScriptArgs):
         sglang_ep_size = 4
     # MXFP8 rollout dense GEMM uses the cutlass backend and routed MoE uses
     # FlashInfer's TRT-LLM kernel (mirrors the pre-rebase MXFP8 recipe).
-    sglang_fp8_gemm_backend = "flashinfer_cutlass" if args.rollout_mxfp8 else "auto"
+    if args.rollout_mxfp8:
+        sglang_fp8_gemm_backend = "flashinfer_cutlass"
+    else:
+        sglang_fp8_gemm_backend = "auto"
     if args.rollout_mxfp8:
         sglang_moe_runner_backend = "flashinfer_trtllm_routed"
     elif args.model_name == "DeepSeek-V4-Pro-FP8":
