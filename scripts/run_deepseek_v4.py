@@ -56,7 +56,7 @@ _MEGATRON_MODEL_TYPE = {
 _PRO_MODEL_NAMES = ("DeepSeek-V4-Pro-FP8",)
 _BLACKWELL_HARDWARE = ("B200", "B300", "GB200", "GB300")
 
-_DSV4_MXFP8_TE_PRECISION_CONFIG = """
+_DSV4_TE_PRECISION_CONFIG = """
 configs:
   bf16:
     transformer_engine_config_type: "TEQuantizationParams"
@@ -535,11 +535,19 @@ def _train(args: ScriptArgs):
         sglang_tp_size = 4
         sglang_dp_size = 1
         sglang_ep_size = 4
-    # MXFP8 rollout dense GEMM uses the cutlass backend (mirrors run_deepseek_v32.py).
+    # MXFP8 rollout dense GEMM uses the cutlass backend and routed MoE uses
+    # FlashInfer's TRT-LLM kernel (mirrors the pre-rebase MXFP8 recipe).
     sglang_fp8_gemm_backend = "flashinfer_cutlass" if args.rollout_mxfp8 else "auto"
+    if args.rollout_mxfp8:
+        sglang_moe_runner_backend = "flashinfer_trtllm_routed"
+    elif args.model_name == "DeepSeek-V4-Pro-FP8":
+        sglang_moe_runner_backend = "deep_gemm"
+    else:
+        sglang_moe_runner_backend = "auto"
     sglang_args = (
         f"--rollout-num-gpus-per-engine {sglang_world_size} "
         f"--sglang-fp8-gemm-backend {sglang_fp8_gemm_backend} "
+        f"--sglang-moe-runner-backend {sglang_moe_runner_backend} "
         f"--sglang-tp-size {sglang_tp_size} "
         f"--sglang-dp-size {sglang_dp_size} "
         f"--sglang-ep-size {sglang_ep_size} "
@@ -551,7 +559,6 @@ def _train(args: ScriptArgs):
         sglang_args += (
             "--sglang-enable-dp-attention "
             "--sglang-cuda-graph-max-bs 8 "
-            "--sglang-moe-runner-backend deep_gemm "
             "--sglang-moe-a2a-backend deepep "
             "--sglang-deepep-mode low_latency "
         )
@@ -638,7 +645,7 @@ def _train(args: ScriptArgs):
         misc_args += f"""--train-env-vars '{{"NVTE_FP8_BLOCK_SCALING_FP32_SCALES":"{fp32_scales}"}}' """
 
     if (args.train_fp8 or args.train_mxfp8) and "--te-precision-config-file" not in args.extra_args:
-        misc_args += f"--te-precision-config-file " f"{U.save_to_temp_file(_DSV4_MXFP8_TE_PRECISION_CONFIG, 'yaml')} "
+        misc_args += f"--te-precision-config-file " f"{U.save_to_temp_file(_DSV4_TE_PRECISION_CONFIG, 'yaml')} "
 
     train_args = (
         f"{ckpt_args} "
