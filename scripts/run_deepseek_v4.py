@@ -135,13 +135,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
         if self.model_name in _PRO_MODEL_NAMES:
             self.enable_r3 = False
         assert not (self.train_fp8 and self.train_mxfp8), "train_fp8 and train_mxfp8 are mutually exclusive"
-        assert not (
-            self.rollout_fp8 and self.rollout_mxfp8
-        ), "rollout_fp8 and rollout_mxfp8 are mutually exclusive"
+        assert not (self.rollout_fp8 and self.rollout_mxfp8), "rollout_fp8 and rollout_mxfp8 are mutually exclusive"
         if self.hardware in ("H100", "H200"):
-            assert not (
-                self.train_mxfp8 or self.rollout_mxfp8
-            ), "train_mxfp8/rollout_mxfp8 require Blackwell"
+            assert not (self.train_mxfp8 or self.rollout_mxfp8), "train_mxfp8/rollout_mxfp8 require Blackwell"
         assert self.rollout_num_nodes >= 0
         assert self.rollout_num_nodes < self.num_nodes
         self.colocate = self.rollout_num_nodes == 0
