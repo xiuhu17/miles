@@ -30,7 +30,7 @@ def test_router_mode_lifts_worker_addr_and_filters(caplog):
     count = scraper.scrape_once(now=123.0)
 
     assert urls == ["http://router:3000/engine_metrics"]
-    assert count == len(records) == 5  # 2 running + 2 throughput + 1 token_usage
+    assert count == len(records) == 5  # 2 running + 2 throughput + 1 token_usage; unlisted name dropped
     assert {r.metric for r in records} == {"sglang_num_running_reqs", "sglang_gen_throughput", "sglang_token_usage"}
     assert all(r.ts == 123.0 for r in records)
 

@@ -962,23 +962,93 @@ class MetricStore:
             if lanes is None or (e.node, e.gpu) in lanes
         ]
 
+    # cumulative engine families are stored raw; the catalog exposes them as
+    # per-interval derived series instead
+    ENGINE_RATE_METRICS: ClassVar[dict[str, str]] = {
+        "sglang_prompt_tokens_per_s": "sglang_prompt_tokens_total",
+        "sglang_generation_tokens_per_s": "sglang_generation_tokens_total",
+        "sglang_requests_per_s": "sglang_num_requests_total",
+        "sglang_aborted_requests_per_s": "sglang_num_aborted_requests_total",
+    }
+    ENGINE_MEAN_METRICS: ClassVar[dict[str, str]] = {
+        "sglang_ttft_mean_s": "sglang_time_to_first_token_seconds",
+        "sglang_inter_token_latency_mean_s": "sglang_inter_token_latency_seconds",
+        "sglang_time_per_output_token_mean_s": "sglang_time_per_output_token_seconds",
+        "sglang_e2e_latency_mean_s": "sglang_e2e_request_latency_seconds",
+    }
+    _CUMULATIVE_SUFFIXES: ClassVar[tuple[str, ...]] = ("_total", "_sum", "_count")
+
     def engine_metric_names(self) -> list[str]:
         """Distinct scraped engine metrics — the L0 sglang category catalog."""
-        return sorted(self._readers[Stream.ENGINE_SERIES].window(None, None).get_column("metric").unique())
+        raw = set(self._readers[Stream.ENGINE_SERIES].window(None, None).get_column("metric").unique())
+        names = {name for name in raw if not name.endswith(self._CUMULATIVE_SUFFIXES)}
+        names.update(derived for derived, base in self.ENGINE_RATE_METRICS.items() if base in raw)
+        names.update(
+            derived
+            for derived, base in self.ENGINE_MEAN_METRICS.items()
+            if base + "_sum" in raw and base + "_count" in raw
+        )
+        return sorted(names)
 
     def engine_series(
         self, metric: str, *, t0: float | None = None, t1: float | None = None, max_points: int = 2000
     ) -> list[dict]:
-        """One series per (engine addr, label set) for the given metric."""
+        """One series per (engine addr, label set) for the given metric.
+
+        Derived names (``ENGINE_RATE_METRICS`` / ``ENGINE_MEAN_METRICS``) are
+        computed from adjacent raw cumulative samples; a counter reset or an
+        interval without completions leaves a gap, never a fabricated value."""
+        if metric in self.ENGINE_RATE_METRICS:
+            parts = self._engine_parts(self.ENGINE_RATE_METRICS[metric], t0, t1)
+            return self._derived_series(parts, None, max_points)
+        if metric in self.ENGINE_MEAN_METRICS:
+            base = self.ENGINE_MEAN_METRICS[metric]
+            return self._derived_series(
+                self._engine_parts(base + "_sum", t0, t1), self._engine_parts(base + "_count", t0, t1), max_points
+            )
+        out = []
+        for (addr, labels_json), part in self._engine_parts(metric, t0, t1).items():
+            ts, values = stride_downsample(part["ts"].to_numpy(), part["value"].to_numpy(), max_points)
+            out.append(dict(addr=addr, labels=_engine_labels(labels_json), ts=ts.tolist(), value=values.tolist()))
+        return out
+
+    def _engine_parts(self, metric: str, t0: float | None, t1: float | None) -> dict[tuple[str, str], pl.DataFrame]:
         frame = self._window(self._readers[Stream.ENGINE_SERIES].window(t0, t1), t0, t1).filter(
             pl.col("metric") == metric
         )
+        return {
+            key: part.sort("ts")
+            for key, part in sorted(frame.partition_by(["addr", "labels_json"], as_dict=True).items())
+        }
+
+    def _derived_series(self, num_parts, den_parts, max_points: int) -> list[dict]:
+        """Per-interval derivative: rate when ``den_parts`` is None (dt as the
+        denominator), else delta(num)/delta(den) joined on scrape timestamps."""
         out = []
-        for (addr, labels_json), part in sorted(frame.partition_by(["addr", "labels_json"], as_dict=True).items()):
-            part = part.sort("ts")
-            ts, values = stride_downsample(part["ts"].to_numpy(), part["value"].to_numpy(), max_points)
-            labels = {k: v for k, v in json.loads(labels_json).items() if v is not None}
-            out.append(dict(addr=addr, labels=labels, ts=ts.tolist(), value=values.tolist()))
+        for (addr, labels_json), num in num_parts.items():
+            ts = num["ts"].to_numpy()
+            values = num["value"].to_numpy()
+            if den_parts is None:
+                den_ts, den_values = ts, None
+            else:
+                den = den_parts.get((addr, labels_json))
+                if den is None:
+                    continue
+                den_ts, den_values = den["ts"].to_numpy(), den["value"].to_numpy()
+                shared, num_idx, den_idx = np.intersect1d(ts, den_ts, return_indices=True)
+                ts, values, den_values = shared, values[num_idx], den_values[den_idx]
+            if len(ts) < 2:
+                continue
+            d_num = np.diff(values)
+            d_den = np.diff(ts) if den_values is None else np.diff(den_values)
+            keep = (d_num >= 0) & (d_den > 0)
+            point_ts, point_values = ts[1:][keep], d_num[keep] / d_den[keep]
+            if not len(point_ts):
+                continue
+            point_ts, point_values = stride_downsample(point_ts, point_values, max_points)
+            out.append(
+                dict(addr=addr, labels=_engine_labels(labels_json), ts=point_ts.tolist(), value=point_values.tolist())
+            )
         return out
 
     def lane_index(self) -> list[dict]:
@@ -1265,6 +1335,10 @@ class MetricStore:
 
 
 # ------------------------------ downsampling --------------------------------
+
+
+def _engine_labels(labels_json: str) -> dict:
+    return {k: v for k, v in json.loads(labels_json).items() if v is not None}
 
 
 def stride_downsample(xs, ys, max_points: int) -> tuple[np.ndarray, np.ndarray]:

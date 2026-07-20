@@ -52,6 +52,20 @@ DEFAULT_METRIC_WHITELIST = (
     "sglang_num_decode_transfer_queue_reqs",
     "sglang_kv_transfer_speed_gb_s",
     "sglang_kv_transfer_latency_ms",
+    # cumulative families (counters + histogram _sum/_count): stored raw,
+    # served as per-interval rates/means by Store.engine_series
+    "sglang_prompt_tokens_total",
+    "sglang_generation_tokens_total",
+    "sglang_num_requests_total",
+    "sglang_num_aborted_requests_total",
+    "sglang_time_to_first_token_seconds_sum",
+    "sglang_time_to_first_token_seconds_count",
+    "sglang_inter_token_latency_seconds_sum",
+    "sglang_inter_token_latency_seconds_count",
+    "sglang_time_per_output_token_seconds_sum",
+    "sglang_time_per_output_token_seconds_count",
+    "sglang_e2e_request_latency_seconds_sum",
+    "sglang_e2e_request_latency_seconds_count",
 )
 
 # label subset passed through to EngineSample.labels (e.g. PD prefill/decode)
@@ -153,11 +167,12 @@ class SglangScraper:
 
         count = 0
         for family in text_string_to_metric_families(text):
-            # raw engines export "sglang:x", the router aggregation "sglang_x"
-            name = family.name.replace(":", "_")
-            if name not in self.whitelist:
-                continue
             for sample in family.samples:
+                # raw engines export "sglang:x", the router aggregation "sglang_x";
+                # histogram _sum/_count are sample names within a base-named family
+                name = sample.name.replace(":", "_")
+                if name not in self.whitelist:
+                    continue
                 sample_addr = addr if addr is not None else sample.labels.get("worker_addr")
                 if sample_addr is None:
                     self._warn(f"router sample for {name} lacks worker_addr; dropping")

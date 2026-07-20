@@ -234,6 +234,29 @@ def dump_dummy_telemetry(
                 store.append(
                     EngineSample(ts=ts, addr=addr, metric="sglang_gen_throughput", labels={}, value=running * 50.0)
                 )
+                store.append(
+                    EngineSample(
+                        ts=ts, addr=addr, metric="sglang_generation_tokens_total", labels={}, value=offset * 100.0
+                    )
+                )
+                store.append(
+                    EngineSample(
+                        ts=ts,
+                        addr=addr,
+                        metric="sglang_time_to_first_token_seconds_sum",
+                        labels={},
+                        value=offset * 0.4,
+                    )
+                )
+                store.append(
+                    EngineSample(
+                        ts=ts,
+                        addr=addr,
+                        metric="sglang_time_to_first_token_seconds_count",
+                        labels={},
+                        value=offset * 2.0,
+                    )
+                )
 
     _trajectory_events(store, truth, samples_per_step)
     store.flush()
