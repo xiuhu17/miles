@@ -50,6 +50,21 @@ const M_LEFT = 96;
 const M_TOP = 24;
 const M_RIGHT = 14;
 
+// relative elapsed since T0, auto-scaled so a multi-hour/day run stays
+// readable instead of "+186:23" (Shang's ask): mm:ss below an hour, h:mm:ss
+// below a day, d hh:mm:ss beyond that
+function formatElapsed(seconds) {
+  const rel = Math.max(0, Math.round(seconds));
+  const pad = (n) => String(n).padStart(2, "0");
+  const days = Math.floor(rel / 86400);
+  const hours = Math.floor((rel % 86400) / 3600);
+  const mins = Math.floor((rel % 3600) / 60);
+  const secs = rel % 60;
+  if (days > 0) return `+${days}d ${pad(hours)}:${pad(mins)}:${pad(secs)}`;
+  if (hours > 0) return `+${hours}:${pad(mins)}:${pad(secs)}`;
+  return `+${mins}:${pad(secs)}`;
+}
+
 export async function renderTimeline(view, meta, route) {
   // mutable data state, reloaded on every follow-mode refresh
   let selection = route?.lanes || null; // lane-selection grammar string
@@ -69,6 +84,7 @@ export async function renderTimeline(view, meta, route) {
   let haveData = false;
   let overlayMetric = meta.capabilities.has_engine_series ? OVERLAY_METRICS[0] : null;
   let showMem = false;
+  let showAbsolute = false; // x-axis ticks: relative "+h:mm:ss" (default) vs wall-clock
   let multiNode = false;
   const laneKey = (l) => `${l.node}:${l.gpu}`;
   // hard viewport cap (design §17): the lane view never displays more than
@@ -217,10 +233,16 @@ export async function renderTimeline(view, meta, route) {
       { class: showMem ? "active" : "", onclick: () => ((showMem = !showMem), renderToolbar(), draw()) },
       ["mem"],
     );
+    const absBtn = el(
+      "button",
+      { class: showAbsolute ? "active" : "", onclick: () => ((showAbsolute = !showAbsolute), renderToolbar(), draw()) },
+      ["abs time"],
+    );
     toolbar.replaceChildren(
       el("span", { class: "muted" }, ["overlay"]),
       ...(meta.capabilities.has_engine_series ? chips : [el("span", { class: "muted" }, ["(no engine series)"])]),
       memBtn,
+      absBtn,
       el(
         "button",
         { onclick: () => ((v1 = T1), (v0 = Math.max(T0, T1 - MAXW)), afterViewChange()) },
@@ -384,9 +406,8 @@ export async function renderTimeline(view, meta, route) {
     const span = v1 - v0;
     const tickStep = [1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600].find((s) => span / s <= 10) || 7200;
     for (let t = Math.ceil((v0 - T0) / tickStep) * tickStep + T0; t <= v1; t += tickStep) {
-      const rel = Math.round(t - T0);
-      const label = `+${Math.floor(rel / 60)}:${String(rel % 60).padStart(2, "0")}`;
-      ctx.fillText(label, X(t) - 12, 12);
+      const label = showAbsolute ? new Date(t * 1000).toLocaleTimeString() : formatElapsed(t - T0);
+      ctx.fillText(label, X(t) - Math.min(30, label.length * 3.2), 12);
       ctx.beginPath();
       ctx.moveTo(X(t), M_TOP - 6);
       ctx.lineTo(X(t), M_TOP + lanes.length * LANE_H);
@@ -564,7 +585,7 @@ export async function renderTimeline(view, meta, route) {
     const lane = lanes[laneIdx];
     const key = laneKey(lane);
     const t = timeAt(ev.clientX);
-    const lines = [`g${lane.index} ${key}  +${fmtNum(t - T0)}s`];
+    const lines = [`g${lane.index} ${key}  ${showAbsolute ? new Date(t * 1000).toLocaleTimeString() : formatElapsed(t - T0)}`];
     const phase = (phasesByLane.get(key) ?? []).find((p) => p.t0 <= t && t < p.t1);
     if (phase) lines.push(`phase: ${phase.name}${phase.rank >= 0 ? ` (rank ${phase.rank})` : ""}`);
     const series = gpu[key];
