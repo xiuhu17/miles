@@ -37,8 +37,8 @@ def _args(tmp_path) -> Namespace:
 def test_tracking_backend_end_to_end_local_ray(tmp_path):
     ray = pytest.importorskip("ray")
     from miles.dashboard import backend, hooks
-    from miles.utils.tracking_utils import finish_tracking, init_tracking
-    from miles.utils.tracking_utils import log as tracking_log
+    from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
+    from miles.utils.tracking_utils.tracking import log as tracking_log
 
     ray.init(num_cpus=2, include_dashboard=False, ignore_reinit_error=True, logging_level="ERROR")
     saved_sinks = list(Timer().event_sinks)
