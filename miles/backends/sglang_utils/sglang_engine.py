@@ -433,7 +433,11 @@ class SGLangEngine(RayActor):
         """Flush the cache of the server."""
         if self.node_rank != 0:
             return
-        # flush cache will not return status_code 200 when there are pending requests
+        # flush cache will not return status_code 200 when there are pending
+        # requests -- that 400 is a normal response, not an exception, so the
+        # backoff sleep must run for it too, or the 60 attempts burn through
+        # in a fraction of a second instead of giving in-flight generation
+        # ~60s to actually drain
         for _ in range(60):
             try:
                 response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
@@ -443,8 +447,7 @@ class SGLangEngine(RayActor):
                 raise e
             except Exception as e:
                 logger.info(f"Error flushing cache: {e}")
-                time.sleep(1)
-                continue
+            time.sleep(1)
         else:
             raise TimeoutError("Timeout while flushing cache.")
 
