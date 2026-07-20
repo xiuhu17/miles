@@ -52,6 +52,7 @@ class Stream(StrEnum):
     ENGINE_SERIES = "engine_series"
     TRAJECTORIES = "trajectories"
     GPU_PROCESSES = "gpu_processes"
+    DATA_BUFFER = "data_buffer"
 
     @property
     def filename(self) -> str:
@@ -145,6 +146,20 @@ class TopologySnapshot(Record):
         return cls(ts=data["ts"], engines=[EngineInfo(**e) for e in data["engines"]])
 
 
+@dataclass
+class DataBufferSample(Record):
+    """One report of ``RolloutDataSourceWithBuffer.get_buffer_length()``
+    (design doc's "show the data status in databuffer" ask). Appended once
+    per ``RolloutManager.generate()`` call — a no-op for plain
+    ``RolloutDataSource`` runs, which never buffer samples across steps.
+    Low-rate and unpartitioned like ``TopologySnapshot``: only the latest
+    value matters for display."""
+
+    stream: ClassVar[Stream] = Stream.DATA_BUFFER
+    ts: float
+    length: int
+
+
 class TrajectoryEventKind(StrEnum):
     ATTEMPT_START = "attempt_start"
     GEN_START = "gen_start"
@@ -225,6 +240,7 @@ _RECORD_TYPE_OF_STREAM: dict[Stream, type[Record]] = {
         EngineSample,
         TrajectoryEvent,
         GpuProcessSample,
+        DataBufferSample,
     )
 }
 
@@ -804,6 +820,13 @@ class MetricStore:
             )
             for i, snapshot in enumerate(snapshots)
         ]
+
+    def latest_data_buffer_length(self) -> int | None:
+        """Most recent ``RolloutDataSourceWithBuffer`` buffer length, or None
+        when the run's data source never reported one (plain RolloutDataSource,
+        or a dump predating this probe)."""
+        records = self.records[Stream.DATA_BUFFER]
+        return records[-1].length if records else None
 
     def phases_by_lane(
         self, *, t0: float | None = None, t1: float | None = None, lanes: set[tuple[str, int]] | None = None

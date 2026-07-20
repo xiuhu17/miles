@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from miles.dashboard.store import (
+    DataBufferSample,
     EngineInfo,
     EngineSample,
     GpuProcessSample,
@@ -47,6 +48,7 @@ def _one_of_each() -> list:
         ),
         EngineSample(ts=10.6, addr="http://10.0.0.2:15000", metric="sglang_num_running_reqs", labels={}, value=42.0),
         GpuProcessSample(ts=10.8, node="10.0.0.2", gpu=0, pid=4321, name="sglang", mem_mb=40960),
+        DataBufferSample(ts=10.9, length=5),
     ]
 
 
@@ -83,6 +85,16 @@ def test_flush_clears_buffers_and_appends(tmp_path):
     for stream in Stream:
         got = reader.iter_records(stream) if stream in MetricStore.PARTITIONED_STREAMS else reader.records[stream]
         assert len(got) == 2, stream
+
+
+def test_latest_data_buffer_length(tmp_path):
+    writer = MetricStore(tmp_path)
+    assert MetricStore.load(tmp_path).latest_data_buffer_length() is None  # never reported
+
+    writer.append(DataBufferSample(ts=1.0, length=3))
+    writer.append(DataBufferSample(ts=2.0, length=7))
+    writer.flush()
+    assert MetricStore.load(tmp_path).latest_data_buffer_length() == 7  # most recent, not first/max
 
 
 def test_gpu_processes_window_and_lane_filter(tmp_path):

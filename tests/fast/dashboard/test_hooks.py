@@ -26,6 +26,7 @@ class FakeHandle:
         self.push_metrics = FakeRemoteMethod()
         self.update_topology = FakeRemoteMethod()
         self.set_router = FakeRemoteMethod()
+        self.push_data_buffer = FakeRemoteMethod()
 
 
 @pytest.fixture(autouse=True)
@@ -250,6 +251,39 @@ def test_register_router_before_router_start_is_a_wiring_bug(monkeypatch):
 
 def test_register_router_without_collector_is_noop():
     hooks.register_router(_router_args())  # must not raise
+
+
+# ---------------------------- data buffer report ----------------------------
+
+
+def test_report_data_buffer_pushes_length(monkeypatch):
+    handle = FakeHandle()
+    monkeypatch.setattr(backend, "_handle", handle)
+    hooks.report_data_buffer(7)
+    [(args, kwargs)] = handle.push_data_buffer.calls
+    (sample,) = args
+    assert sample.length == 7
+    assert kwargs == {}
+
+
+def test_report_data_buffer_none_is_noop(monkeypatch):
+    handle = FakeHandle()
+    monkeypatch.setattr(backend, "_handle", handle)
+    hooks.report_data_buffer(None)  # plain RolloutDataSource: nothing to report
+    assert handle.push_data_buffer.calls == []
+
+
+def test_report_data_buffer_without_collector_is_noop():
+    hooks.report_data_buffer(7)  # must not raise
+
+
+def test_report_data_buffer_swallows_push_failures(monkeypatch, caplog):
+    handle = FakeHandle()
+    handle.push_data_buffer = FakeRemoteMethod(fail=True)
+    monkeypatch.setattr(backend, "_handle", handle)
+    with caplog.at_level(logging.WARNING):
+        hooks.report_data_buffer(7)  # must not raise
+    assert any("data-buffer report failed" in r.message for r in caplog.records)
 
 
 def test_phase_sink_begin_pushes_open_event_immediately():

@@ -88,6 +88,7 @@ def make_app(store: MetricStore, reader: DumpReader, *, follow: bool = False) ->
             run_name=store.meta.run_name if store.meta else None,
             start_ts=store.meta.start_ts if store.meta else None,
             wandb_url=_wandb_url(store.meta.args) if store.meta else None,
+            data_buffer_length=store.latest_data_buffer_length(),
             time_range=store.time_range(),
             rollout_ids=dict(train=ids.train, eval=ids.eval),
             metric_keys=store.metric_keys() + dump_keys,

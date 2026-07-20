@@ -30,6 +30,7 @@ from typing import Any, ClassVar
 
 from miles.dashboard.sglang_scraper import DEFAULT_METRIC_WHITELIST, ScrapeMode, SglangScraper
 from miles.dashboard.store import (
+    DataBufferSample,
     EngineInfo,
     EngineSample,
     GpuProcessSample,
@@ -213,6 +214,9 @@ class DashboardCollector:
     def push_gpu_processes(self, node: str, batch: list[GpuProcessSample]) -> None:
         for sample in batch:
             self._append(sample)
+
+    def push_data_buffer(self, sample: DataBufferSample) -> None:
+        self._append(sample)
 
     def update_topology(self, snapshot: TopologySnapshot) -> None:
         # an addr the actor path ever registered must not be resurrected as

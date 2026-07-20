@@ -42,6 +42,19 @@ def test_meta(client):
     assert meta["capabilities"]["has_tokenizer"] is True
     assert meta["capabilities"]["has_timeline"] is False
     assert meta["wandb_url"] is None  # empty args snapshot in this fixture
+    assert meta["data_buffer_length"] is None  # never reported in this fixture
+
+
+def test_meta_reports_latest_data_buffer_length(dump_dir):
+    from miles.dashboard.store import DataBufferSample
+
+    writer = MetricStore(dump_dir / "dashboard")
+    writer.append(DataBufferSample(ts=104.0, length=3))
+    writer.append(DataBufferSample(ts=105.0, length=6))
+    writer.flush()
+
+    client = TestClient(make_app(MetricStore.load(dump_dir / "dashboard"), DumpReader(dump_dir)))
+    assert client.get("/api/meta").json()["data_buffer_length"] == 6
 
 
 def test_wandb_url():

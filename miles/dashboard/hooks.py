@@ -16,7 +16,15 @@ import time
 from dataclasses import dataclass
 
 from miles.dashboard.logging_utils import RateLimitedWarner
-from miles.dashboard.store import EngineInfo, PhaseEvent, Role, TopologySnapshot, TrajectoryEvent, TrajectoryEventKind
+from miles.dashboard.store import (
+    DataBufferSample,
+    EngineInfo,
+    PhaseEvent,
+    Role,
+    TopologySnapshot,
+    TrajectoryEvent,
+    TrajectoryEventKind,
+)
 from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.timer import Timer
 
@@ -312,6 +320,24 @@ def register_engines(servers) -> None:
         _engines_fingerprint = fingerprint
     except Exception:
         _warner.warn("dashboard engine registration failed; topology may be stale")
+
+
+def report_data_buffer(length: int | None) -> None:
+    """Called at the top of every ``RolloutManager.generate()`` alongside
+    ``register_engines``, with ``getattr(data_source, "get_buffer_length",
+    lambda: None)()``. A no-op for ``length is None`` — most data sources
+    (plain ``RolloutDataSource``) never buffer samples across steps."""
+    if length is None:
+        return
+    from miles.dashboard import backend
+
+    handle = backend.current_collector()
+    if handle is None:
+        return
+    try:
+        handle.push_data_buffer.remote(DataBufferSample(ts=time.time(), length=length))
+    except Exception:
+        _warner.warn("dashboard data-buffer report failed")
 
 
 def _alive_engine_chunks(servers) -> list[list]:

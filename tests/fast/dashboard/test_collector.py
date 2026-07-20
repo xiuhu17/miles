@@ -7,6 +7,7 @@ from tests.fast.dashboard.dummy_telemetry import BASE_TS, dump_dummy_telemetry
 from miles.dashboard.collector import CollectorConfig, DashboardCollector
 from miles.dashboard.sglang_scraper import ScrapeMode
 from miles.dashboard.store import (
+    DataBufferSample,
     EngineInfo,
     GpuProcessSample,
     GpuSample,
@@ -82,6 +83,16 @@ def test_push_gpu_processes_round_trips(tmp_path):
         dict(ts=2.0, node="n", gpu=0, pid=111, name="sglang", mem_mb=4096),
         dict(ts=2.0, node="n", gpu=1, pid=222, name="train", mem_mb=8192),
     ]
+
+
+def test_push_data_buffer_round_trips(tmp_path):
+    collector = make_collector(tmp_path)
+    collector.push_data_buffer(DataBufferSample(ts=3.0, length=4))
+    collector.push_data_buffer(DataBufferSample(ts=4.0, length=9))
+    collector.flush()
+
+    replayed = MetricStore.load(tmp_path / "dashboard")
+    assert replayed.latest_data_buffer_length() == 9
 
 
 def _engine(addr: str) -> EngineInfo:

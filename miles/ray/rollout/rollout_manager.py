@@ -113,6 +113,7 @@ class RolloutManager:
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
         dashboard_hooks.register_engines(self.servers)
+        dashboard_hooks.report_data_buffer(getattr(self.data_source, "get_buffer_length", lambda: None)())
         with timer("rollout"):
             data, metadata, metrics = await self._get_rollout_data(rollout_id=rollout_id)
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False)

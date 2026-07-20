@@ -255,6 +255,9 @@ export async function renderTimeline(view, meta, route) {
       ),
       overlayScale,
       followBadge,
+      ...(meta.data_buffer_length != null
+        ? [el("span", { class: "muted" }, [`databuffer: ${meta.data_buffer_length} groups`])]
+        : []),
       el("span", { class: "muted" }, [`wheel = zoom · drag = pan · window ≤ ${Math.round(MAXW / 3600)}h`]),
     );
   };
