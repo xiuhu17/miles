@@ -124,17 +124,12 @@ def _post_process_rewards(args, samples: list[Sample] | list[list[Sample]], cust
 
 def split_train_data_by_dp(args, data, dp_size):
     """Split the train data by data parallel size."""
-    return [Box(ray.put(shard)) for shard in split_train_data_by_dp_local(args, data, dp_size)]
+    rollout_data_list = split_train_data_by_dp_raw(args, data, dp_size=dp_size)
+    return [Box(ray.put(rollout_data)) for rollout_data in rollout_data_list]
 
 
-def split_train_data_by_dp_local(args, data, dp_size) -> list[dict]:
-    """Transport-free core of :func:`split_train_data_by_dp`: returns the plain
-    per-DP-rank shard dicts (each still carrying its ``partition`` key)."""
-    rollout_data = {}
-
-    if "prompt" in data:
-        rollout_data["prompt"] = data["prompt"]
-
+def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> list[dict[str, Any]]:
+    """Split the train data by data parallel size."""
     total_lengths = [len(t) for t in data["tokens"]]
     data["total_lengths"] = total_lengths
 
@@ -164,6 +159,7 @@ def split_train_data_by_dp_local(args, data, dp_size) -> list[dict]:
             "prompt",
             "teacher_log_probs",
             "opd_reverse_kl",
+            "seq_witness_ids",
             "weight_versions",
         ]:
             if key not in data:

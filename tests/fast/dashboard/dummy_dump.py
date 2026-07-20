@@ -12,7 +12,7 @@ Real code invoked per step, in the real call order:
 
 1. ``save_debug_rollout_data``            (rollout + eval dump files)
 2. ``convert_samples_to_train_data``      (column dict incl. ``sample_indices``)
-3. ``split_train_data_by_dp_local``       (real seqlen-balanced DP partition)
+3. ``split_train_data_by_dp_raw``         (real seqlen-balanced DP partition)
 4. ``process_rollout_data_shard``         (train-side partition pop / reorder)
 5. ``save_debug_train_data_for_rank``     (per-rank train dump files)
 
@@ -40,7 +40,7 @@ from miles.ray.rollout.debug_data import save_debug_rollout_data
 from miles.ray.rollout.train_data_conversion import (
     convert_samples_to_train_data,
     process_rollout_data_shard,
-    split_train_data_by_dp_local,
+    split_train_data_by_dp_raw,
 )
 from miles.utils.train_dump_utils import save_debug_train_data_for_rank
 from miles.utils.types import Sample
@@ -111,7 +111,7 @@ def dump_dummy_run(
             custom_convert_samples_to_train_data_func=None,
             custom_reward_post_process_func=None,
         )
-        shards = split_train_data_by_dp_local(args, train_data, dp_size)
+        shards = split_train_data_by_dp_raw(args, train_data, dp_size=dp_size)
         truth.shard_indices[rollout_id] = [list(shard["sample_indices"]) for shard in shards]
         generator = torch.Generator().manual_seed(rng.randint(0, 2**31))
         for shard_index, shard in enumerate(shards):
