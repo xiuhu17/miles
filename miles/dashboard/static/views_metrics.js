@@ -9,7 +9,56 @@ import { drawChart, drawMultiLine, SERIES_COLORS } from "./charts.js";
 // advertise it while a telemetry stream exists.
 const CATEGORY_ORDER = ["rollout", "perf", "train", "eval", "dump"];
 
-const categoryOf = (key) => key.split("/")[0];
+// trainer-side recomputations logged under the rollout/step axis (they share
+// that step key, not because they're rollout-generation metrics) — displayed
+// under "train" so they don't get lost among reward/response_length. Display
+// grouping only: the key name and its rollout/step x-axis are untouched.
+const TRAIN_DISPLAY_OVERRIDE = new Set([
+  "rollout/log_probs",
+  "rollout/ref_log_probs",
+  "rollout/rollout_log_probs",
+  "rollout/teacher_log_probs",
+]);
+
+const categoryOf = (key) => (TRAIN_DISPLAY_OVERRIDE.has(key) ? "train" : key.split("/")[0]);
+
+// one-line descriptions shown as a native tooltip on the chart title, matched
+// by substring against the part after the category prefix — most specific
+// pattern first, so e.g. "ref_log_probs" is checked before generic
+// "log_probs". Best-effort v1; extend as new metrics show up.
+const METRIC_DESCRIPTIONS = [
+  ["teacher_log_probs", "log-prob under a distillation teacher model"],
+  ["ref_log_probs", "log-prob under the reference (KL-anchor) policy"],
+  ["rollout_log_probs", "log-prob reported by the rollout engine at generation time"],
+  ["log_probs", "trainer-recomputed log-prob of the response under the current policy"],
+  ["ref_entropy", "per-token entropy under the reference policy"],
+  ["entropy", "trainer-recomputed per-token entropy of the response distribution"],
+  ["response_length", "generated-response length in tokens"],
+  ["reward", "scalar reward assigned to the sampled response"],
+  ["truncated", "samples that hit the length/turn limit before finishing"],
+  ["zero_std", "GRPO groups whose reward std is ~0 — no gradient signal from that group"],
+  ["mean_abs_lp_diff", "mean |trainer log-prob − rollout log-prob| — rollout/train policy staleness"],
+  ["mixed_version", "samples whose tokens span more than one weight version"],
+  ["step_time", "wall-clock seconds for one step"],
+  ["wait_time_ratio", "fraction of the step spent idle/waiting rather than computing"],
+  ["cpu_memory", "host CPU memory (RSS) sampled around this step, in GB"],
+  ["advantages", "GRPO advantage (reward normalized within its group)"],
+  ["returns", "return used for the policy-gradient / value target"],
+  ["grad_norm", "global gradient norm before clipping"],
+  ["pg_clipfrac", "fraction of tokens where the PPO clip bound was active"],
+  ["kl", "KL divergence between the current and reference policy"],
+  ["loss", "training loss for this step"],
+  ["num_running_reqs", "requests concurrently running on the sglang engine"],
+  ["gen_throughput", "generated tokens per second"],
+  ["token_usage", "fraction of KV cache capacity currently in use"],
+  ["cache_hit_rate", "prefix-cache hit rate"],
+];
+
+function describeMetric(key) {
+  const suffix = key.slice(key.indexOf("/") + 1);
+  const hit = METRIC_DESCRIPTIONS.find(([pattern]) => suffix.includes(pattern));
+  return hit ? hit[1] : undefined;
+}
 
 function axisOf(key) {
   if (key.startsWith("dump/")) return "dump";
@@ -124,7 +173,8 @@ export async function renderMetrics(view, meta) {
         const canvas = el("canvas", { class: "chart" });
         const status = el("p", { class: "muted" }, ["loading…"]);
         slots.set(key, { canvas, status, signature: null });
-        return el("div", { class: "panel" }, [el("p", { class: "chart-title" }, [key]), status, canvas]);
+        const title = el("p", { class: "chart-title", title: describeMetric(key) }, [key]);
+        return el("div", { class: "panel" }, [title, status, canvas]);
       }),
     );
     refresh();
