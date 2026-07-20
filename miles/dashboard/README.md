@@ -13,7 +13,7 @@ python train.py ... \
 ```
 
 `--use-miles-dashboard` adds a named collector actor on the driver node, one
-NVML sampler per GPU node, per-rank phase interval sinks on the existing
+NVML + host-memory sampler per GPU node, per-rank phase interval sinks on the existing
 `Timer` instrumentation, and an sglang engine-metric scraper. Everything is
 appended under `{dump-details}/dashboard/` (append-only JSONL). Overhead on
 the training path is a few milliseconds per step; all pushes are
@@ -36,8 +36,10 @@ Views:
 
 - **metrics** — every logged metric plus `dump/*` per-step aggregates; click
   a rollout-axis point to drill into that step.
-- **timeline** — per-GPU lanes: phase band (rollout / train / update_weights,
-  hatched `train_wait` idle), NVML utilization, sglang engine overlay
+- **timeline** — one node-level CPU memory-pressure row plus per-GPU lanes:
+  phase band (rollout / actor_train / critic_train / update_weights, hatched `train_wait` idle),
+  NVML utilization, sglang engine overlay. Hover CPU memory for
+  used/available/total GiB.
   (running requests, throughput, KV usage), bubble strip with click-to-zoom.
 - **step drill-down** — per-trajectory table and scatter, GRPO group
   degeneracy (`zero_std`), generation-time columns, eval tab.
