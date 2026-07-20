@@ -63,7 +63,7 @@ function crumbs(route, meta) {
   // click-through from chart points; land on the newest train step
   const latest = meta.rollout_ids.train.at(-1);
   if (latest !== undefined) {
-    parts.push(nav("Data / Trajectories", `#/rollout/${latest}`, route.view === "rollout" || route.view === "tokens"));
+    parts.push(nav("Rollouts", `#/rollout/${latest}`, route.view === "rollout" || route.view === "tokens"));
   }
   if (route.view === "rollout" || route.view === "tokens") {
     const evalSuffix = route.evaluation ? "?eval=1" : "";
@@ -93,8 +93,13 @@ async function render() {
   try {
     const meta = await getMeta();
     crumbs(route, meta);
+    const modeLabel =
+      meta.mode === "follow" ? "● live — auto-refreshing from a still-running job" : "◼ static snapshot — job has finished";
     const runinfo = [
-      `${meta.run_name ?? "unnamed run"} · ${meta.mode}` + (meta.capabilities.has_metrics ? "" : " · dump-derived metrics"),
+      el("span", {}, [`run: ${meta.run_name ?? "unnamed run"}`]),
+      " · ",
+      el("span", { title: modeLabel }, [meta.mode === "follow" ? "● live" : "◼ static"]),
+      ...(meta.capabilities.has_metrics ? [] : [" · dump-derived metrics"]),
     ];
     if (meta.wandb_url) runinfo.push(" · ", el("a", { href: meta.wandb_url, target: "_blank" }, ["wandb ↗"]));
     document.getElementById("runinfo").replaceChildren(...runinfo);

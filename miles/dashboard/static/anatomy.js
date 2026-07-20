@@ -3,13 +3,13 @@ import { hideTooltip, showTooltip } from "./charts.js";
 
 // batch anatomy swimlanes (design §18.4, visual contract: batch_anatomy_demo)
 const COLORS = {
-  gen: "#1d9e75",
-  tool: "#d97706",
-  attempt: "#e7eaef", // queue/underlay: idle recedes, activity pops
-  consume: "#2f6feb",
-  text: "#24292f",
-  muted: "#667080",
-  stale: "#d85a30",
+  gen: "#d55816",
+  tool: "#1baf7a",
+  attempt: "#efe8dc", // queue/underlay: idle recedes, activity pops
+  consume: "#2a78d6",
+  text: "#231f1c",
+  muted: "#7a7168",
+  stale: "#c23b3b",
 };
 const M_TOP = 18;
 

@@ -208,7 +208,7 @@ function installDragZoom(canvas, { plotLeft, plotRight, plotTop, plotBottom, inv
       redraw();
       const a = canvas._dragAnchor;
       const ctx = canvas.getContext("2d");
-      ctx.fillStyle = "rgba(47, 111, 235, 0.15)";
+      ctx.fillStyle = "rgba(213, 88, 22, 0.15)";
       // full-height band while the drag is x-only; a box once it has y extent
       const boxY = Math.abs(cur.y - a.y) >= AXIS_MIN_DRAG;
       ctx.fillRect(
@@ -276,24 +276,30 @@ export function hideTooltip() {
   if (tooltipEl) tooltipEl.style.display = "none";
 }
 
-// diverging color for values around a center (e.g. imp_ratio around 1)
+// diverging color for values around a center (e.g. imp_ratio around 1) —
+// blue/red is the standard warm/cool diverging pair (design system's
+// categorical blue + red steps); brand orange sits at neither pole, since
+// orange reads as neither clearly "high" nor "low" on a hot/cold mental model
 export function divergingColor(t) {
   // t in [-1, 1]: blue -> transparent -> red
   const a = Math.min(1, Math.abs(t)) * 0.85;
-  return t >= 0 ? `rgba(224, 96, 96, ${a})` : `rgba(78, 161, 255, ${a})`;
+  return t >= 0 ? `rgba(227, 73, 72, ${a})` : `rgba(42, 120, 214, ${a})`;
 }
 
-// sequential color for magnitudes in [0, 1]
+// sequential color for magnitudes in [0, 1] — single hue (aqua), light->dark
 export function sequentialColor(t) {
-  return `rgba(70, 194, 142, ${Math.min(1, Math.max(0, t)) * 0.85})`;
+  return `rgba(27, 175, 122, ${Math.min(1, Math.max(0, t)) * 0.85})`;
 }
 
 
-// fixed categorical order, assigned by sorted-series index (stable across
-// refreshes because the store sorts by addr); cycles past 10 series
+// fixed categorical order (design-system 8 hues, brand orange in the orange
+// slot — validated colorblind-safe with scripts/validate_palette.js from the
+// dataviz skill), assigned by sorted-series index (stable across refreshes
+// because the store sorts by addr); slots 9-10 are muted extensions for the
+// rare run with more than 8 concurrent engines
 export const SERIES_COLORS = [
-  "#2f6feb", "#e8590c", "#12b886", "#d6336c", "#7048e8",
-  "#f59f00", "#0c8599", "#5c940d", "#a61e4d", "#495057",
+  "#2a78d6", "#d55816", "#1baf7a", "#e87ba4", "#4a3aa7",
+  "#eda100", "#e34948", "#008300", "#8a6d3b", "#5c6570",
 ];
 
 // seriesList: [{label, ts: [], value: []}] — one thin line per engine on a

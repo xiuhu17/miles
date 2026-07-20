@@ -7,21 +7,24 @@ const M_LEFT = 96;
 const M_RIGHT = 14;
 const X_BUCKETS = 1200;
 const METRICS = ["util", "phase", "mem_mb", "power_w", "lifecycle"];
-const LIFECYCLE_COLORS = { queue: "#cfd6e0", generating: "#1d9e75", tool_wait: "#d97706" };
+const LIFECYCLE_COLORS = { queue: "#e8e1d8", generating: "#d55816", tool_wait: "#1baf7a" };
 const MAX_LABELED_ROWS = 48;
 
-// sequential ramp for magnitude metrics: one hue, light -> dark
-const RAMP_LO = [238, 241, 246];
-const RAMP_HI = [22, 64, 143];
-const NO_DATA = [245, 246, 248]; // page bg: absence recedes
-const MUTED = "#667080";
-const TEXT = "#24292f";
-const ACCENT = "#2f6feb";
+// sequential ramp for magnitude metrics: one hue (aqua, matches charts.js
+// sequentialColor), light -> dark
+const RAMP_LO = [237, 242, 240];
+const RAMP_HI = [11, 93, 71];
+const NO_DATA = [250, 247, 244]; // page bg: absence recedes
+const MUTED = "#7a7168";
+const TEXT = "#231f1c";
+const ACCENT = "#d55816";
 
-// carpet-only wake_up shift: the lane view's #ba7517 is deutan-indistinguishable
-// from update_weights (dE 5.9) without position/width context, so the carpet
-// moves it toward yellow (dE 20.7 against update_weights, validator-checked)
-const CARPET_WAKE_UP = "#d4a017";
+// carpet-only wake_up shift: the lane view's #e34948 is too close to
+// update_weights' #e87ba4 (dE 13.2, below the normal-vision floor) without
+// position/width context to tell them apart, so the carpet moves wake_up to
+// a cool blue instead (dE 16.2+ against update_weights/data_preprocess/
+// rollout, validator-checked: scripts/validate_palette.js)
+const CARPET_WAKE_UP = "#1864ab";
 
 const hexToRgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
 
@@ -104,7 +107,7 @@ export function createCarpet(opts) {
     const lut = new Array(256).fill(NO_DATA);
     if (data.palette) {
       data.palette.forEach((name, i) => {
-        if (i > 0) lut[i] = hexToRgb(LIFECYCLE_COLORS[name] ?? phaseColors[name] ?? "#98a1b0");
+        if (i > 0) lut[i] = hexToRgb(LIFECYCLE_COLORS[name] ?? phaseColors[name] ?? "#9c9488");
       });
     } else {
       for (let v = 0; v < 256; v++) {

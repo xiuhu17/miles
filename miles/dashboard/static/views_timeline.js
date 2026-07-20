@@ -3,36 +3,41 @@ import { el, fmtNum, setViewCleanup } from "./app.js";
 import { createCarpet } from "./carpet.js";
 import { hideTooltip, showTooltip } from "./charts.js";
 
+// idle states share a light neutral family (train_wait also gets a hatch
+// texture below — the accessibility channel — so idle doesn't lean on hue
+// alone); the log_probs family shares one hue at three lightness steps;
+// rollout gets the brand orange as the headline phase. Validated against
+// the design system's 8-hue categorical order (scripts/validate_palette.js).
 const PHASE_COLORS = {
-  initialize: "#b8c4d8",
-  rollout: "#1d9e75",
-  eval_rollout: "#5dcaa5",
-  actor_train: "#7f77dd",
-  train_log_probs: "#afa9ec",
-  log_probs: "#afa9ec",
-  ref_log_probs: "#9f97e0",
-  data_preprocess: "#8b95a5",
-  train_wait: "#e4e7ec",
-  update_weights: "#d85a30",
-  ref_model_update: "#b98156",
-  save_model: "#8a6d3b",
-  sleep: "#d6dbe3",
-  wake_up: "#ba7517",
+  initialize: "#ded6ca",
+  rollout: "#d55816",
+  eval_rollout: "#e8a683",
+  actor_train: "#2a78d6",
+  train_log_probs: "#c3b8ec",
+  log_probs: "#8b7bd8",
+  ref_log_probs: "#4a3aa7",
+  data_preprocess: "#eda100",
+  train_wait: "#efe8dc",
+  update_weights: "#e87ba4",
+  ref_model_update: "#008300",
+  save_model: "#1baf7a",
+  sleep: "#e5ddd0",
+  wake_up: "#e34948",
 };
-const DEFAULT_PHASE_COLOR = "#98a1b0";
+const DEFAULT_PHASE_COLOR = "#9c9488";
 const OVERLAY_METRICS = [
   "sglang_num_running_reqs",
   "sglang_gen_throughput",
   "sglang_token_usage",
   "sglang_cache_hit_rate",
 ];
-const OVERLAY_COLOR = "#d97706";
-const MEM_COLOR = "#1a9e6e";
-const UTIL_STROKE = "rgba(47, 111, 235, 0.9)";
-const UTIL_FILL = "rgba(47, 111, 235, 0.14)";
-const TEXT = "#24292f";
-const MUTED = "#667080";
-const GRID = "#e3e7ee";
+const OVERLAY_COLOR = "#b84a12";
+const MEM_COLOR = "#1baf7a";
+const UTIL_STROKE = "rgba(42, 120, 214, 0.9)";
+const UTIL_FILL = "rgba(42, 120, 214, 0.14)";
+const TEXT = "#231f1c";
+const MUTED = "#7a7168";
+const GRID = "#e8e1d8";
 
 const FOLLOW_REDRAW_MS = 5000;
 const LANE_CAP = 32;
