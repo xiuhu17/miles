@@ -8,6 +8,7 @@ from miles.dashboard.collector import CollectorConfig, DashboardCollector
 from miles.dashboard.sglang_scraper import ScrapeMode
 from miles.dashboard.store import (
     EngineInfo,
+    GpuProcessSample,
     GpuSample,
     MetricsRecord,
     MetricStore,
@@ -65,6 +66,22 @@ def test_collector_satisfies_dummy_telemetry_contract(tmp_path):
     assert replayed.engine_series("sglang_num_running_reqs") == reference.engine_series("sglang_num_running_reqs")
     assert replayed.bubbles() == reference.bubbles()
     assert replayed.meta.run_name == reference.meta.run_name
+
+
+def test_push_gpu_processes_round_trips(tmp_path):
+    collector = make_collector(tmp_path)
+    batch = [
+        GpuProcessSample(ts=2.0, node="n", gpu=0, pid=111, name="sglang", mem_mb=4096),
+        GpuProcessSample(ts=2.0, node="n", gpu=1, pid=222, name="train", mem_mb=8192),
+    ]
+    collector.push_gpu_processes("n", batch)
+    collector.flush()
+
+    replayed = MetricStore.load(tmp_path / "dashboard")
+    assert replayed.gpu_processes() == [
+        dict(ts=2.0, node="n", gpu=0, pid=111, name="sglang", mem_mb=4096),
+        dict(ts=2.0, node="n", gpu=1, pid=222, name="train", mem_mb=8192),
+    ]
 
 
 def _engine(addr: str) -> EngineInfo:

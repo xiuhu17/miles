@@ -51,6 +51,7 @@ class Stream(StrEnum):
     GPU_UTIL = "gpu_util"
     ENGINE_SERIES = "engine_series"
     TRAJECTORIES = "trajectories"
+    GPU_PROCESSES = "gpu_processes"
 
     @property
     def filename(self) -> str:
@@ -198,8 +199,33 @@ class EngineSample(Record):
     value: float
 
 
+@dataclass
+class GpuProcessSample(Record):
+    """One NVML per-process memory reading on one GPU, at a coarser cadence
+    than GpuSample (design doc's GPU/CPU/disk memory-breakdown TODO — this
+    covers the GPU side: who is actually holding the VRAM, not just the
+    per-GPU aggregate)."""
+
+    stream: ClassVar[Stream] = Stream.GPU_PROCESSES
+    ts: float
+    node: str
+    gpu: int
+    pid: int
+    name: str
+    mem_mb: int
+
+
 _RECORD_TYPE_OF_STREAM: dict[Stream, type[Record]] = {
-    cls.stream: cls for cls in (MetricsRecord, PhaseEvent, TopologySnapshot, GpuSample, EngineSample, TrajectoryEvent)
+    cls.stream: cls
+    for cls in (
+        MetricsRecord,
+        PhaseEvent,
+        TopologySnapshot,
+        GpuSample,
+        EngineSample,
+        TrajectoryEvent,
+        GpuProcessSample,
+    )
 }
 
 
@@ -342,6 +368,7 @@ class MetricStore:
         Stream.ENGINE_SERIES,
         Stream.PHASES,
         Stream.TRAJECTORIES,
+        Stream.GPU_PROCESSES,
     )
     MAX_WINDOW_S: ClassVar[float] = 4 * 3600.0
     PARTITION_CACHE_BLOCKS: ClassVar[int] = 24
@@ -385,7 +412,7 @@ class MetricStore:
                 line_stamps=lambda data: (data["ts"],),
                 max_blocks=self.PARTITION_CACHE_BLOCKS,
             )
-        assert stream in (Stream.PHASES, Stream.TRAJECTORIES), stream
+        assert stream in (Stream.PHASES, Stream.TRAJECTORIES, Stream.GPU_PROCESSES), stream
         record_type = _RECORD_TYPE_OF_STREAM[stream]
         return _PartitionReader(
             self.dir / stream.value,
@@ -709,6 +736,8 @@ class MetricStore:
             return list(self._phase_events(None, None))
         if stream is Stream.TRAJECTORIES:
             return self.trajectory_events()
+        if stream is Stream.GPU_PROCESSES:
+            return self._readers[stream].window(None, None)
         return list(self.records[stream])
 
     @staticmethod
@@ -896,6 +925,19 @@ class MetricStore:
                 power_w=part["power_w"].to_numpy()[indices].tolist(),
             )
         return out
+
+    def gpu_processes(
+        self, *, t0: float | None = None, t1: float | None = None, lanes: set[tuple[str, int]] | None = None
+    ) -> list[dict]:
+        """Per-process memory snapshots in [t0, t1] (coarser cadence than
+        ``gpu_series``): the timeline hover resolves the nearest snapshot per
+        lane client-side, same as it already does for the util/mem series."""
+        events = self._window_records(self._readers[Stream.GPU_PROCESSES].window(t0, t1), t0, t1)
+        return [
+            dict(ts=e.ts, node=e.node, gpu=e.gpu, pid=e.pid, name=e.name, mem_mb=e.mem_mb)
+            for e in events
+            if lanes is None or (e.node, e.gpu) in lanes
+        ]
 
     def engine_metric_names(self) -> list[str]:
         """Distinct scraped engine metrics — the L0 sglang category catalog."""

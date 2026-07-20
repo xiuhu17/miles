@@ -4,6 +4,7 @@ import pytest
 from miles.dashboard.store import (
     EngineInfo,
     EngineSample,
+    GpuProcessSample,
     GpuSample,
     Meta,
     MetricsRecord,
@@ -45,6 +46,7 @@ def _one_of_each() -> list:
             detail="",
         ),
         EngineSample(ts=10.6, addr="http://10.0.0.2:15000", metric="sglang_num_running_reqs", labels={}, value=42.0),
+        GpuProcessSample(ts=10.8, node="10.0.0.2", gpu=0, pid=4321, name="sglang", mem_mb=40960),
     ]
 
 
@@ -81,6 +83,27 @@ def test_flush_clears_buffers_and_appends(tmp_path):
     for stream in Stream:
         got = reader.iter_records(stream) if stream in MetricStore.PARTITIONED_STREAMS else reader.records[stream]
         assert len(got) == 2, stream
+
+
+def test_gpu_processes_window_and_lane_filter(tmp_path):
+    writer = MetricStore(tmp_path)
+    writer.append(GpuProcessSample(ts=1.0, node="n1", gpu=0, pid=1, name="sglang", mem_mb=100))
+    writer.append(GpuProcessSample(ts=1.0, node="n1", gpu=1, pid=2, name="train", mem_mb=200))
+    writer.append(GpuProcessSample(ts=20.0, node="n2", gpu=0, pid=3, name="sglang", mem_mb=300))
+    writer.flush()
+
+    reader = MetricStore.load(tmp_path)
+    assert reader.gpu_processes() == [
+        dict(ts=1.0, node="n1", gpu=0, pid=1, name="sglang", mem_mb=100),
+        dict(ts=1.0, node="n1", gpu=1, pid=2, name="train", mem_mb=200),
+        dict(ts=20.0, node="n2", gpu=0, pid=3, name="sglang", mem_mb=300),
+    ]
+    assert reader.gpu_processes(t0=10.0, t1=30.0) == [
+        dict(ts=20.0, node="n2", gpu=0, pid=3, name="sglang", mem_mb=300),
+    ]
+    assert reader.gpu_processes(lanes={("n1", 1)}) == [
+        dict(ts=1.0, node="n1", gpu=1, pid=2, name="train", mem_mb=200),
+    ]
 
 
 def test_follow_incremental(tmp_path):

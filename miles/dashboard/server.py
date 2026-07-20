@@ -153,6 +153,15 @@ def make_app(store: MetricStore, reader: DumpReader, *, follow: bool = False) ->
                 raise ValueError(f"{max_points=} must be >= 2")
             return dict(lanes=store.gpu_series(t0=t0, t1=t1, max_points=max_points, lanes=store.resolve_lanes(lanes)))
 
+    @app.get("/api/timeline/gpu_processes")
+    def timeline_gpu_processes(t0: float | None = None, t1: float | None = None, lanes: str | None = None):
+        """Per-process VRAM breakdown, coarser cadence than ``/api/timeline/gpu``
+        — the frontend resolves the nearest snapshot per lane client-side, same
+        as it already does for the util/mem series."""
+        with _translate_errors():
+            _check_window(t0, t1)
+            return dict(processes=store.gpu_processes(t0=t0, t1=t1, lanes=store.resolve_lanes(lanes)))
+
     @app.get("/api/timeline/heatmap")
     def timeline_heatmap(
         metric: str = "util",

@@ -74,6 +74,7 @@ export async function renderTimeline(view, meta, route) {
   let lanes = [];
   let windows = [];
   let phasesByLane = new Map();
+  let processesByLane = new Map();
   let bubbles = [];
   let gpu = {};
   let engineSeries = [];
@@ -124,6 +125,7 @@ export async function renderTimeline(view, meta, route) {
       lanes = [];
       gpu = {};
       phasesByLane = new Map();
+      processesByLane = new Map();
       return;
     }
 
@@ -146,9 +148,10 @@ export async function renderTimeline(view, meta, route) {
         history.replaceState(null, "", `#/timeline?lanes=${encodeURIComponent(selection)}`);
       }
     }
-    const [phasesRes, gpuRes] = await Promise.all([
+    const [phasesRes, gpuRes, processesRes] = await Promise.all([
       api("/api/timeline/phases", { t0: f0, t1: f1, lanes: selection }),
       api("/api/timeline/gpu", { t0: f0, t1: f1, max_points: 4000, lanes: selection }),
+      api("/api/timeline/gpu_processes", { t0: f0, t1: f1, lanes: selection }),
     ]);
     engineSeries = overlayMetric
       ? (await api("/api/timeline/engine_series", { metric: overlayMetric, t0: f0, t1: f1, max_points: 4000 }))
@@ -171,6 +174,8 @@ export async function renderTimeline(view, meta, route) {
     multiNode = new Set(lanes.map((l) => l.node)).size > 1;
     phasesByLane = new Map(lanes.map((l) => [laneKey(l), []]));
     for (const p of phasesRes.phases) phasesByLane.get(`${p.node}:${p.gpu}`)?.push(p);
+    processesByLane = new Map(lanes.map((l) => [laneKey(l), []]));
+    for (const p of processesRes.processes) processesByLane.get(`${p.node}:${p.gpu}`)?.push(p);
   }
 
   // pan/zoom past the fetched bounds: debounced windowed reload
@@ -595,6 +600,18 @@ export async function renderTimeline(view, meta, route) {
         if (Math.abs(series.ts[j] - t) < Math.abs(series.ts[best] - t)) best = j;
       }
       lines.push(`util: ${series.util[best]}%  mem: ${fmtNum(series.mem_mb[best] / 1024)}G`);
+    }
+    const procs = processesByLane.get(key) ?? [];
+    if (procs.length) {
+      // per-process snapshots are far coarser than the util/mem series —
+      // snap to the nearest snapshot's own ts, then list every process in it
+      let nearestTs = procs[0].ts;
+      for (const p of procs) if (Math.abs(p.ts - t) < Math.abs(nearestTs - t)) nearestTs = p.ts;
+      const top = procs
+        .filter((p) => p.ts === nearestTs)
+        .sort((a, b) => b.mem_mb - a.mem_mb)
+        .slice(0, 3);
+      lines.push("top processes:", ...top.map((p) => `  ${p.name} (pid ${p.pid}): ${fmtNum(p.mem_mb / 1024)}G`));
     }
     if (overlayMetric) {
       const addr = engineAt(lane.node, lane.gpu, t);

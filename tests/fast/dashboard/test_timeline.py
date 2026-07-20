@@ -160,6 +160,11 @@ def test_timeline_endpoints(tmp_path):
     bubbles = client.get("/api/timeline/bubbles").json()
     assert len(bubbles["bubbles"]) == truth.steps
 
+    # dummy_telemetry doesn't emit per-process samples: smoke-test the wiring
+    processes = client.get("/api/timeline/gpu_processes").json()
+    assert processes["processes"] == []
+    assert client.get("/api/timeline/gpu_processes", params={"t0": 5, "t1": 1}).status_code == 400
+
 
 def test_open_interval_clips_to_data_edge_and_closed_twin_wins(tmp_path):
     from miles.dashboard.store import GpuSample, Meta, PhaseEvent, Role

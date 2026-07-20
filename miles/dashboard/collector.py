@@ -32,6 +32,7 @@ from miles.dashboard.sglang_scraper import DEFAULT_METRIC_WHITELIST, ScrapeMode,
 from miles.dashboard.store import (
     EngineInfo,
     EngineSample,
+    GpuProcessSample,
     GpuSample,
     Meta,
     MetricsRecord,
@@ -56,6 +57,16 @@ class _SelfGpuPush:
 
     def __call__(self, node: str, batch: list[GpuSample]) -> None:
         self._handle.push_gpu_samples.remote(node, batch)
+
+
+class _SelfGpuProcessPush:
+    """Same as ``_SelfGpuPush`` for the per-process memory breakdown stream."""
+
+    def __init__(self, handle):
+        self._handle = handle
+
+    def __call__(self, node: str, batch: list[GpuProcessSample]) -> None:
+        self._handle.push_gpu_processes.remote(node, batch)
 
 
 def _default_list_gpu_nodes() -> list[tuple[str, str]]:
@@ -85,7 +96,12 @@ def _default_spawn_sampler(node_id: str, node_ip: str, interval: float):
             num_cpus=0,
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
         )
-        .remote(_SelfGpuPush(ray.get_runtime_context().current_actor), node=node_ip, interval=interval)
+        .remote(
+            _SelfGpuPush(ray.get_runtime_context().current_actor),
+            node=node_ip,
+            interval=interval,
+            push_processes=_SelfGpuProcessPush(ray.get_runtime_context().current_actor),
+        )
     )
     if ray.get(handle.start.remote()):
         return handle
@@ -191,6 +207,10 @@ class DashboardCollector:
             self._append(event)
 
     def push_gpu_samples(self, node: str, batch: list[GpuSample]) -> None:
+        for sample in batch:
+            self._append(sample)
+
+    def push_gpu_processes(self, node: str, batch: list[GpuProcessSample]) -> None:
         for sample in batch:
             self._append(sample)
 

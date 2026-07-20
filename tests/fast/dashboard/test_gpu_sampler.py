@@ -4,7 +4,7 @@ import time
 import pytest
 
 from miles.dashboard.gpu_sampler import GpuSampler
-from miles.dashboard.store import GpuSample
+from miles.dashboard.store import GpuProcessSample, GpuSample
 
 
 class FakeNvml:
@@ -39,10 +39,26 @@ class FakeNvml:
     def nvmlDeviceGetPowerUsage(self, handle):
         return 600_000 + handle  # milliwatts
 
+    def nvmlDeviceGetComputeRunningProcesses(self, handle):
+        if handle in self.failing_devices:
+            raise RuntimeError("GPU is lost")
+        return [type("Proc", (), {"pid": 1000 + handle, "usedGpuMemory": (handle + 1) * 512 * 1024 * 1024})()]
+
+    def nvmlSystemGetProcessName(self, pid):
+        return f"proc-{pid}"
+
 
 class PushSpy:
     def __init__(self):
         self.calls: list[tuple[str, list[GpuSample]]] = []
+
+    def __call__(self, node, batch):
+        self.calls.append((node, batch))
+
+
+class ProcessPushSpy:
+    def __init__(self):
+        self.calls: list[tuple[str, list[GpuProcessSample]]] = []
 
     def __call__(self, node, batch):
         self.calls.append((node, batch))
@@ -109,6 +125,43 @@ def test_thread_lifecycle_flushes_on_stop():
     assert total >= 3  # ~8 ticks at 10ms; generous margin against scheduler jitter
 
 
+def test_sample_processes_once_converts_units():
+    push = PushSpy()
+    push_processes = ProcessPushSpy()
+    sampler = GpuSampler(push, node="n", nvml=FakeNvml(count=2), push_processes=push_processes)
+    assert sampler.sample_processes_once(ts=5.0) == 2
+    sampler.flush()
+    [(node, batch)] = push_processes.calls
+    assert node == "n"
+    assert batch == [
+        GpuProcessSample(ts=5.0, node="n", gpu=0, pid=1000, name="proc-1000", mem_mb=512),
+        GpuProcessSample(ts=5.0, node="n", gpu=1, pid=1001, name="proc-1001", mem_mb=1024),
+    ]
+
+
+def test_failing_device_skipped_for_process_sampling(caplog):
+    push = PushSpy()
+    push_processes = ProcessPushSpy()
+    sampler = GpuSampler(push, node="n", nvml=FakeNvml(count=3, failing_devices={1}), push_processes=push_processes)
+    with caplog.at_level(logging.WARNING):
+        assert sampler.sample_processes_once(ts=1.0) == 2
+    sampler.flush()
+    [(_, batch)] = push_processes.calls
+    assert [s.gpu for s in batch] == [0, 2]
+    assert any("skipping this tick" in r.message for r in caplog.records)
+
+
+def test_process_batch_dropped_silently_without_push_processes():
+    # sampling still works if called directly, but flush() must not crash or
+    # invent a push destination — the buffer is just discarded (design: the
+    # feature is a no-op end-to-end when the collector never wires it up)
+    push = PushSpy()
+    sampler = GpuSampler(push, node="n", nvml=FakeNvml(count=1))
+    assert sampler.sample_processes_once(ts=1.0) == 1
+    sampler.flush()
+    assert push.calls == []
+
+
 def test_interval_must_be_positive():
     with pytest.raises(AssertionError):
         GpuSampler(lambda n, b: None, node="n", interval=0, nvml=FakeNvml())
@@ -125,12 +178,19 @@ def test_real_nvml_when_gpus_present():
         pytest.skip("no usable NVML device")
 
     push = PushSpy()
-    sampler = GpuSampler(push, node="local", nvml=pynvml)
+    push_processes = ProcessPushSpy()
+    sampler = GpuSampler(push, node="local", nvml=pynvml, push_processes=push_processes)
     assert sampler.available
     assert sampler.sample_once(ts=1.0) >= 1
+    # idle test GPUs may have zero compute processes — asserting >= 0 just
+    # guards that the real nvmlDeviceGetComputeRunningProcesses call doesn't raise
+    assert sampler.sample_processes_once(ts=1.0) >= 0
     sampler.flush()
     [(_, batch)] = push.calls
     sample = batch[0]
     assert 0 <= sample.util <= 100
     assert sample.mem_mb >= 0 and sample.power_w >= 0
     assert sampler.gpu_uuids()[0].startswith("GPU-")
+    if push_processes.calls:
+        proc_sample = push_processes.calls[0][1][0]
+        assert proc_sample.pid > 0 and proc_sample.mem_mb >= 0 and proc_sample.name
