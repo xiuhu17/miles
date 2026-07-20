@@ -32,14 +32,32 @@ function colorFor(stat, values) {
   return (v) => sequentialColor(((spec.negate ? -v : v) - lo) / Math.max(hi - lo, 1e-9));
 }
 
+async function groupNavPanel(rolloutId, sampleIndex, evaluation) {
+  const { rows } = await api(`/api/rollout/${rolloutId}/summary`, { eval: evaluation });
+  const groupIndex = rows.find((r) => r.sample_index === sampleIndex)?.group_index;
+  const siblings = groupIndex == null ? [] : rows.filter((r) => r.group_index === groupIndex).map((r) => r.sample_index).sort((a, b) => a - b);
+  if (siblings.length < 2) return null; // no group, or a lone sample: nothing to navigate
+  const position = siblings.indexOf(sampleIndex);
+  const goto = (idx) => (location.hash = `#/rollout/${rolloutId}/sample/${idx}${evaluation ? "?eval=1" : ""}`);
+  return el("div", { class: "controls" }, [
+    el("button", { onclick: () => position > 0 && goto(siblings[position - 1]) }, ["◀ prev in group"]),
+    el("span", {}, [`group ${groupIndex} · sample ${position + 1}/${siblings.length}`]),
+    el("button", { onclick: () => position < siblings.length - 1 && goto(siblings[position + 1]) }, ["next in group ▶"]),
+  ]);
+}
+
 export async function renderTokens(view, meta, route) {
   const { rolloutId, sampleIndex, evaluation } = route;
   view.replaceChildren(el("p", { class: "muted" }, ["loading sample…"]));
 
+  // group nav reuses the (parquet-cached, cheap) summary rows already fetched
+  // for the step's samples tab — no detokenize needed to jump between siblings
+  const groupNav = await groupNavPanel(rolloutId, sampleIndex, evaluation);
+
   // cheap panels first: the lifecycle lane (telemetry) and the conversation
   // (trajectory sidecar); the token machinery costs a full dump load plus
   // detokenize, so it only starts when its tab is opened
-  const panels = [];
+  const panels = groupNav ? [groupNav] : [];
   if (!evaluation) {
     try {
       const trajectories = await api(`/api/rollout/${rolloutId}/trajectories`, { sample_index: sampleIndex });
