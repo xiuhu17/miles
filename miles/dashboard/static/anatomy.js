@@ -81,8 +81,8 @@ export function createAnatomy({ lanes, consumeTs, rowsByIndex, onClickSample }) 
   const panel = el("div", { class: "panel" }, [
     el("h3", {}, [
       single
-        ? `sample s${lanes[0].sample_index} lifecycle — generated, waited, tool-called`
-        : "batch anatomy — when each sample generated, waited, tool-called",
+        ? `Sample s${lanes[0].sample_index} lifecycle — generated, waited, tool-called`
+        : "Batch anatomy — when each sample generated, waited, tool-called",
     ]),
     ...(single ? [] : [sortRow]),
     wrap,
@@ -101,6 +101,7 @@ export function createAnatomy({ lanes, consumeTs, rowsByIndex, onClickSample }) 
   // segments are already client-side, no refetch.
   let v0 = T0;
   let v1 = T1;
+  let hoverI = null; // row under the cursor: highlighted so a click target is obvious at ROW <= 4px
   const X = (t, w) => M_LEFT + ((t - v0) / Math.max(v1 - v0, 1e-9)) * (w - M_LEFT - M_RIGHT);
   const tAt = (clientX, rect) => v0 + ((clientX - rect.left - M_LEFT) / (rect.width - M_LEFT - M_RIGHT)) * (v1 - v0);
 
@@ -134,7 +135,10 @@ export function createAnatomy({ lanes, consumeTs, rowsByIndex, onClickSample }) 
       }
 
       const padAttempt = detailed ? 4 : ROW > 2 ? 1 : 0;
-      const padSegment = detailed ? 2 : 0;
+      // compressed mode had zero segment padding, so the colored gen/tool
+      // bars painted over the gap the attempt underlay already reserved,
+      // fusing adjacent rows into one blob; give segments the same hairline
+      const padSegment = detailed ? 2 : ROW > 2 ? 0.75 : 0;
       for (const attempt of lane.attempts) {
         if ((attempt.t1 ?? T1) < v0 || (attempt.t0 ?? T0) > v1) continue;
         ctx.fillStyle = COLORS.attempt;
@@ -160,6 +164,11 @@ export function createAnatomy({ lanes, consumeTs, rowsByIndex, onClickSample }) 
       }
     });
 
+    if (hoverI !== null && hoverI >= 0 && hoverI < order.length) {
+      ctx.fillStyle = "rgba(213, 88, 22, 0.07)";
+      ctx.fillRect(0, M_TOP + hoverI * ROW, W, ROW);
+    }
+
     if (consumeTs !== null && consumeTs !== undefined && consumeTs >= v0 && consumeTs <= v1) {
       const x = X(consumeTs, W);
       ctx.strokeStyle = COLORS.consume;
@@ -184,7 +193,10 @@ export function createAnatomy({ lanes, consumeTs, rowsByIndex, onClickSample }) 
   };
   canvas.ondblclick = () => ((v0 = T0), (v1 = T1), draw());
   let dragFrom = null; // {x, v0, v1}; a <4px move on release is a click
-  canvas.onmousedown = (ev) => (dragFrom = { x: ev.clientX, v0, v1 });
+  canvas.onmousedown = (ev) => {
+    dragFrom = { x: ev.clientX, v0, v1 };
+    hoverI = null;
+  };
   canvas.onmouseup = (ev) => {
     const moved = dragFrom && Math.abs(ev.clientX - dragFrom.x) >= 4;
     dragFrom = null;
@@ -208,7 +220,15 @@ export function createAnatomy({ lanes, consumeTs, rowsByIndex, onClickSample }) 
     const x = ev.clientX - rect.left;
     if (i < 0 || i >= order.length || x < M_LEFT || x > rect.width - M_RIGHT) {
       hideTooltip();
+      if (hoverI !== null) {
+        hoverI = null;
+        draw();
+      }
       return;
+    }
+    if (hoverI !== i) {
+      hoverI = i;
+      draw();
     }
     const lane = order[i];
     const t = tAt(ev.clientX, rect);
@@ -227,6 +247,10 @@ export function createAnatomy({ lanes, consumeTs, rowsByIndex, onClickSample }) 
   canvas.onmouseleave = () => {
     hideTooltip();
     dragFrom = null; // leaving the canvas cancels a pan
+    if (hoverI !== null) {
+      hoverI = null;
+      draw();
+    }
   };
 
   renderSort();
