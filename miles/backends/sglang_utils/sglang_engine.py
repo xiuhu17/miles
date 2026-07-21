@@ -341,6 +341,7 @@ class SGLangEngine(RayActor):
         load_format: str | None = None,
         pinned: bool = False,
         added_tokens_config: dict | None = None,
+        expected_checksums: dict | None = None,
     ):
         """Load a LoRA adapter. ``serialized_named_tensors[tp_rank]`` is bytes for TP rank N."""
         payload = {
@@ -353,6 +354,8 @@ class SGLangEngine(RayActor):
             payload["load_format"] = load_format
         if added_tokens_config is not None:
             payload["added_tokens_config"] = added_tokens_config
+        if expected_checksums is not None:
+            payload["expected_checksums"] = expected_checksums
 
         return self._make_request(
             "load_lora_adapter_from_tensors",
