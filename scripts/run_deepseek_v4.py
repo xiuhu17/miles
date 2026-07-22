@@ -639,9 +639,6 @@ def _train(args: ScriptArgs):
         misc_args += "--transformer-impl transformer_engine " "--bf16 " "--fp8-format e4m3 " "--fp8-recipe mxfp8 "
     elif args.train_fp8:
         misc_args += "--transformer-impl transformer_engine " "--bf16 " "--fp8-format e4m3 " "--fp8-recipe blockwise "
-        # On Blackwell, TE emulates the blockwise recipe with MXFP8, which requires pow2 scales.
-        fp32_scales = "0" if _is_blackwell(args) else "1"
-        misc_args += f"""--train-env-vars '{{"NVTE_FP8_BLOCK_SCALING_FP32_SCALES":"{fp32_scales}"}}' """
 
     if (args.train_fp8 or args.train_mxfp8) and "--te-precision-config-file" not in args.extra_args:
         misc_args += f"--te-precision-config-file " f"{U.save_to_temp_file(_DSV4_TE_PRECISION_CONFIG, 'yaml')} "
