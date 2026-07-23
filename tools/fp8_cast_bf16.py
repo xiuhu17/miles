@@ -28,9 +28,14 @@ def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
 
 
 def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """Dequantize an FP8-E4M3 weight with FP32 128x128 block scales (DeepSeek-V3 style)."""
+    assert s.dtype == torch.float32, f"triton dequant expects FP32 scales, got {s.dtype}"
     assert x.is_contiguous() and s.is_contiguous()
     assert x.dim() == 2 and s.dim() == 2
     M, N = x.size()
+    assert s.size(0) == triton.cdiv(M, block_size) and s.size(1) == triton.cdiv(
+        N, block_size
+    ), f"Scale shape {tuple(s.shape)} does not match weight shape {tuple(x.shape)} with block_size={block_size}"
     y = torch.empty_like(x, dtype=torch.get_default_dtype())
 
     def grid(meta):
@@ -38,6 +43,29 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
 
     weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
+
+
+def weight_dequant_e8m0(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize an FP8-E4M3 weight with FP8-E8M0 128x128 block scales (DeepSeek-V4 style).
+
+    Delegates to sglang's official DeepSeek-V4 loader dequant (_dequant_fp8,
+    sglang PR #25820) so the BF16 cast is exactly what the rollout computes
+    when it dequantizes these tensors at load time.
+    """
+    try:
+        from sglang.srt.models.deepseek_v4 import _dequant_fp8
+    except ImportError as e:
+        raise ImportError(
+            "FP8-E8M0 block scales need sglang with DeepSeek-V4 NVFP4 support "
+            "(sglang PR #25820) providing models.deepseek_v4._dequant_fp8."
+        ) from e
+
+    if scale.dtype == torch.uint8:
+        # UE8M0 exponent bytes stored as uint8; same bits as float8_e8m0fnu.
+        assert hasattr(torch, "float8_e8m0fnu"), "this torch build lacks float8_e8m0fnu"
+        scale = scale.view(torch.float8_e8m0fnu)
+    assert torch.get_default_dtype() == torch.bfloat16  # _dequant_fp8 returns bf16
+    return _dequant_fp8(weight, scale)
 
 
 def main(fp8_path, bf16_path):
@@ -98,7 +126,11 @@ def main(fp8_path, bf16_path):
                     # Get scale_inv from the correct file
                     scale_inv = get_tensor(scale_inv_name)
                     fp8_weight_names.append(weight_name)
-                    new_state_dict[weight_name] = weight_dequant(weight, scale_inv)
+                    if scale_inv.dtype == torch.float32:
+                        new_state_dict[weight_name] = weight_dequant(weight, scale_inv)
+                    else:
+                        # FP8-E8M0 / UE8M0 scales (DeepSeek-V4).
+                        new_state_dict[weight_name] = weight_dequant_e8m0(weight, scale_inv)
                 except KeyError:
                     print(f"Warning: Missing scale_inv tensor for {weight_name}, skipping conversion")
                     new_state_dict[weight_name] = weight

@@ -28,8 +28,18 @@ Usage patterns:
        python scripts/run_deepseek_v4.py train            --model-name DeepSeek-V4-Flash-FP8 \
            --num-nodes 8 --num-gpus-per-node 8 \
            --hf-checkpoint /root/models/DeepSeek-V4-Flash-FP8
+
+  3. NVFP4 routed experts (Blackwell only). Adds a BF16 -> NVFP4+blockFP8 rollout
+     checkpoint conversion in prepare; the trainer overrides routed-expert GEMMs
+     to the NVFP4 recipe; weight updates quantize experts to NVFP4:
+       python scripts/run_deepseek_v4.py full-train \
+           --model-name DeepSeek-V4-Flash-FP8-4layer \
+           --num-nodes 1 --num-gpus-per-node 8 --nvfp4-experts
+     With explicit `train`, point --hf-checkpoint at the converted directory
+     ({model_dir}/{model_name}-NVFP4).
 """
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -56,7 +66,7 @@ _MEGATRON_MODEL_TYPE = {
 _PRO_MODEL_NAMES = ("DeepSeek-V4-Pro-FP8",)
 _BLACKWELL_HARDWARE = ("B200", "B300", "GB200", "GB300")
 
-_DSV4_TE_PRECISION_CONFIG = """
+_DSV4_FP8_TE_PRECISION_CONFIG = """
 configs:
   bf16:
     transformer_engine_config_type: "TEQuantizationParams"
@@ -68,6 +78,66 @@ matchers:
     pattern: "*.self_attention.indexer.linear_weights_proj"
     config: "bf16"
 """.strip()
+
+# NVFP4-experts variant: the global recipe stays blockwise FP8 (attention +
+# shared experts, matching the rollout's blockfp8 layers); the routed-expert
+# grouped GEMMs are overridden to the NVFP4 recipe (matching the rollout's
+# modelopt-FP4 experts); the DSA indexer weights_proj stays BF16.
+# Must stay aligned with tools/convert_hf_to_nvfp4_blockfp8.py and
+# processors/quantizer_nvfp4_blockfp8.py.
+_DSV4_NVFP4_TE_PRECISION_CONFIG = """
+configs:
+  bf16:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe: {}
+  blockfp8:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe:
+      fp8_quantization_recipe: "blockwise"
+  nvfp4:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe:
+      fp4_quantization_recipe: "nvfp4"
+matchers:
+  dsa_indexer_weights_proj_bf16:
+    type: "glob"
+    enabled: true
+    pattern: "*.self_attention.indexer.linear_weights_proj"
+    config: "bf16"
+  routed_experts_fc1_nvfp4:
+    type: "glob"
+    enabled: true
+    pattern: "*.mlp.experts.linear_fc1"
+    config: "nvfp4"
+  routed_experts_fc2_nvfp4:
+    type: "glob"
+    enabled: true
+    pattern: "*.mlp.experts.linear_fc2"
+    config: "nvfp4"
+  shared_experts_fc1_blockfp8:
+    type: "glob"
+    enabled: true
+    pattern: "*.mlp.shared_experts.linear_fc1"
+    config: "blockfp8"
+  shared_experts_fc2_blockfp8:
+    type: "glob"
+    enabled: true
+    pattern: "*.mlp.shared_experts.linear_fc2"
+    config: "blockfp8"
+""".strip()
+
+# Trainer-side NVFP4 knobs for the RL-aligned recipe: 1D (1x16) weight blocks,
+# no RHT, no stochastic rounding, row-scaled (per-token) activations, exact
+# math — mirroring the rollout side's per-token FlashInfer quantization
+# (SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1 + disable-fast-math).
+_NVFP4_TRAIN_ENV_VARS = {
+    "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "1",
+    "NVTE_NVFP4_DISABLE_RHT": "1",
+    "NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING": "1",
+    "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+    "NVTE_BACKWARD_OVERRIDE": "dequantized",
+    "NVTE_USE_FAST_MATH": "0",
+}
 
 
 @dataclass
@@ -120,6 +190,13 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # (Hopper: fp32 scales; Blackwell: pow2 scales, MXFP8-emulated), BF16 when False.
     # Rollout always serves the source FP8 checkpoint either way.
     fp8_training: bool = True
+    # NVFP4 routed experts (Blackwell only): trainer runs routed-expert GEMMs in
+    # NVFP4 (row-scaled activations, 1x16 weight blocks) on top of the blockwise
+    # FP8 recipe; rollout serves the mixed NVFP4+blockFP8 checkpoint produced by
+    # tools/convert_hf_to_nvfp4_blockfp8.py with flashinfer_trtllm_routed MoE and
+    # per-token FP4 activations; weight updates quantize routed experts to NVFP4
+    # and everything else to blockwise FP8 (quantizer_nvfp4_blockfp8).
+    nvfp4_experts: bool = False
     enable_mis: bool = False
 
     # pass any extra sglang/miles/megatron args through `--extra-args '--your-arg'`
@@ -132,6 +209,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
             self.model_local_dir = self.model_dir
         if self.model_name in _PRO_MODEL_NAMES:
             self.enable_r3 = False
+        if self.nvfp4_experts:
+            assert self.fp8_training, "nvfp4_experts needs fp8_training (blockwise FP8 is the base recipe)"
         assert self.rollout_num_nodes >= 0
         assert self.rollout_num_nodes < self.num_nodes
         self.colocate = self.rollout_num_nodes == 0
@@ -155,6 +234,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
         if self.model_name == "DeepSeek-V4-Pro-FP8":
             return "DeepSeek-V4-Pro-BF16"
         return f"{self.model_name}-bf16"
+
+    @property
+    def nvfp4_name(self):
+        return f"{self.model_name}-NVFP4"
 
 
 def _is_blackwell(args: ScriptArgs) -> bool:
@@ -216,6 +299,24 @@ def prepare_download(args: ScriptArgs):
     _prepare_download(args)
 
 
+def _convert_nvfp4_blockfp8(args: ScriptArgs):
+    """BF16 -> mixed NVFP4 (routed experts) + blockwise-FP8 rollout checkpoint."""
+    path_dst = f"{args.model_dir}/{args.nvfp4_name}"
+    sentinel = Path(path_dst) / "model.safetensors.index.json"
+    if sentinel.exists():
+        print(f"convert_hf_to_nvfp4_blockfp8 skip {path_dst} since {sentinel} exists")
+        return
+
+    # NVTE_USE_FAST_MATH=0 pins TE's exact-math quantization (its default), so
+    # cold-start NVFP4 bytes match the weight-update quantizer bit-for-bit.
+    U.exec_command(
+        "NVTE_USE_FAST_MATH=0 "
+        f"python {U.repo_base_dir}/tools/convert_hf_to_nvfp4_blockfp8.py "
+        f"--model-dir {args.model_dir}/{args.bf16_name} "
+        f"--save-dir {path_dst} "
+    )
+
+
 def _prepare_single(args: ScriptArgs):
     _download_dataset(args)
 
@@ -224,12 +325,14 @@ def _prepare_single(args: ScriptArgs):
         path_src=src,
         path_dst=f"{args.model_dir}/{args.bf16_name}/",
     )
+    if args.nvfp4_experts:
+        _convert_nvfp4_blockfp8(args)
 
 
 @app.command()
 @U.dataclass_cli
 def prepare_single(args: ScriptArgs):
-    """FP8 -> BF16 cast for Megatron. Needs --hf-checkpoint (or pre-downloaded). One node."""
+    """FP8 -> BF16 cast for Megatron (+ NVFP4 rollout ckpt with --nvfp4-experts). One node."""
     _prepare_single(args)
 
 
@@ -306,6 +409,12 @@ def _prepare_cp(args: ScriptArgs):
         path_dst=f"{args.model_local_dir}/{args.model_name}",
         num_nodes=args.num_nodes,
     )
+    if args.nvfp4_experts:
+        U.rsync_simple(
+            path_src=f"{args.model_dir}/{args.nvfp4_name}",
+            path_dst=f"{args.model_local_dir}/{args.nvfp4_name}",
+            num_nodes=args.num_nodes,
+        )
 
 
 def _get_parallel_config(args: ScriptArgs) -> str:
@@ -375,12 +484,22 @@ def _get_parallel_config(args: ScriptArgs) -> str:
 
 
 def _train(args: ScriptArgs):
-    print(f"[precision] fp8_training={args.fp8_training}")
+    print(f"[precision] fp8_training={args.fp8_training} nvfp4_experts={args.nvfp4_experts}")
     print(
         f"running on {args.num_nodes} nodes "
         f"({args.actor_num_nodes} actor nodes x {args.actor_num_gpus_per_node} GPUs/node, "
         f"{args.rollout_num_gpus} rollout GPUs, colocate={args.colocate})"
     )
+    if args.nvfp4_experts:
+        assert _is_blackwell(args), "nvfp4_experts requires Blackwell (SM100+) hardware"
+        # The experimental FP4 C4 indexer (--enable-deepseek-v4-fp4-indexer,
+        # default off in sglang) must stay off: the NVFP4-experts recipe keeps
+        # the indexer on the FP8 path (wq_b blockfp8 GEMM + FP8 index scoring,
+        # weights_proj BF16), matching the trainer, which has no FP4-indexer
+        # counterpart.
+        assert (
+            "enable-deepseek-v4-fp4-indexer" not in args.extra_args
+        ), "the experimental sglang FP4 indexer is not supported with nvfp4_experts"
     _ensure_4layer_model_type(args)
 
     load_save_path = f"{args.save_dir}/{args.run_id}/checkpoints"
@@ -480,8 +599,34 @@ def _train(args: ScriptArgs):
         sglang_tp_size = 4
         sglang_dp_size = 1
         sglang_ep_size = 4
+    # Explicit rollout kernel backends per recipe (fp8 gemm / moe runner / moe
+    # a2a always set together). Notes:
+    #   - blockfp8 dense GEMMs (attention + shared experts) use fp8-gemm "auto"
+    #     in every recipe: sglang's dispatch_w8a8_block_fp8_linear auto-selects
+    #     deep_gemm / flashinfer_trtllm / cutlass by hardware -- the verified
+    #     default of all existing V4 FP8 runs (unlike MXFP8, whose dispatch
+    #     stays on triton unless flashinfer_cutlass is forced explicitly).
+    #   - a FlashInfer TRT-LLM MoE runner requires a2a "none": the fused
+    #     routed kernel does its own token dispatch, DeepEP is not used.
+    if args.nvfp4_experts:
+        # NVFP4 routed experts run on the FlashInfer TRT-LLM routed MoE kernel
+        # (the only backend with per-token FP4 activation scales).
+        sglang_fp8_gemm_backend = "auto"
+        sglang_moe_runner_backend = "flashinfer_trtllm_routed"
+        sglang_moe_a2a_backend = "none"
+    elif args.model_name == "DeepSeek-V4-Pro-FP8":
+        sglang_fp8_gemm_backend = "auto"
+        sglang_moe_runner_backend = "deep_gemm"
+        sglang_moe_a2a_backend = "deepep"
+    else:
+        sglang_fp8_gemm_backend = "auto"
+        sglang_moe_runner_backend = "auto"
+        sglang_moe_a2a_backend = "none"
     sglang_args = (
         f"--rollout-num-gpus-per-engine {sglang_world_size} "
+        f"--sglang-fp8-gemm-backend {sglang_fp8_gemm_backend} "
+        f"--sglang-moe-runner-backend {sglang_moe_runner_backend} "
+        f"--sglang-moe-a2a-backend {sglang_moe_a2a_backend} "
         f"--sglang-tp-size {sglang_tp_size} "
         f"--sglang-dp-size {sglang_dp_size} "
         f"--sglang-ep-size {sglang_ep_size} "
@@ -489,14 +634,13 @@ def _train(args: ScriptArgs):
         "--router-health-check-interval-secs 15 "
         "--router-health-failure-threshold 40 "  # TODO improve
     )
+    if sglang_moe_a2a_backend == "deepep":
+        sglang_args += "--sglang-deepep-mode low_latency "
+    if args.nvfp4_experts:
+        sglang_args += "--sglang-dsa-topk-backend flashinfer "
+        sglang_args += "--sglang-disable-shared-experts-fusion "
     if args.model_name == "DeepSeek-V4-Pro-FP8":
-        sglang_args += (
-            "--sglang-enable-dp-attention "
-            "--sglang-cuda-graph-max-bs 8 "
-            "--sglang-moe-runner-backend deep_gemm "
-            "--sglang-moe-a2a-backend deepep "
-            "--sglang-deepep-mode low_latency "
-        )
+        sglang_args += "--sglang-enable-dp-attention " "--sglang-cuda-graph-max-bs 8 "
     if args.enable_mtp:
         sglang_args += (
             "--sglang-speculative-algorithm EAGLE "
@@ -506,13 +650,41 @@ def _train(args: ScriptArgs):
         )
     extra_env_vars = {
         "SGLANG_SKIP_CHECKPOINT_LOAD_CHECK": "1",
-        "SGLANG_DSV4_FP4_EXPERTS": "0",
+        "SGLANG_DSV4_FP4_EXPERTS": "1" if args.nvfp4_experts else "0",
         "SGLANG_HEALTH_CHECK_TIMEOUT": "120",
         "SGLANG_DG_CACHE_DIR_PER_PROCESS": "1",
+        # wo_a is a deliberate high-precision carve-out in both the plain-FP8
+        # and mixed NVFP4+blockFP8 launchers.
         "SGLANG_OPT_FP8_WO_A_GEMM": "0",
+        # Quantize the SWA KV cache from bf16-rounded norm outputs (the
+        # two-step _compute_kv_bf16 + store_cache path) instead of the fused
+        # kernel's fp32 registers, matching the trainer-side QAT regardless of
+        # expert recipe. Verified: L0 attention-core diff 1.34e-2 -> 2.0e-3,
+        # rollout/train logprob diff 0.140 -> 0.121. FUSED_STORE_CACHE=0 pins
+        # the store to the bitwise-verified non-fused quantizer.
+        "SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE": "1",
+        "SGLANG_OPT_USE_FUSED_STORE_CACHE": "0",
     }
+    if args.nvfp4_experts:
+        extra_env_vars |= {
+            # Rollout quantizes MoE activations per token, matching the trainer's
+            # NVTE_NVFP4_ROW_SCALED_ACTIVATION=1 (the checkpoint's static
+            # input_scale is neutralized to ones by sglang in this mode).
+            "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1",
+            # FlashInfer FP4 quantization defaults to fast math; disable both
+            # aliases so rollout rounding matches TE's exact-math quantization.
+            "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH": "1",
+            "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH": "1",
+            "SGLANG_DSA_FUSE_TOPK": "0",
+            "SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK": "large",
+            # miles injects this by default (NVSHMEM's internal NCCL conflicts
+            # with ours under CUDA graphs); pinned explicitly per the DSA
+            # alignment reference config.
+            "NVSHMEM_DISABLE_NCCL": "1",
+        }
     if args.model_name == "DeepSeek-V4-Pro-FP8":
-        extra_env_vars["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "256"
+        if sglang_moe_a2a_backend == "deepep":
+            extra_env_vars["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "256"
         extra_env_vars["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
 
     misc_args = (
@@ -548,6 +720,9 @@ def _train(args: ScriptArgs):
             "--custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp "
         )
 
+    if args.nvfp4_experts:
+        misc_args += "--miles-dsa-topk-backend flashinfer "
+
     if args.use_fault_tolerance:
         misc_args += "--use-fault-tolerance "
 
@@ -575,11 +750,19 @@ def _train(args: ScriptArgs):
         misc_args += "--transformer-impl transformer_engine " "--bf16 " "--fp8-format e4m3 " "--fp8-recipe blockwise "
         # On Blackwell, TE emulates the blockwise recipe with MXFP8, which requires pow2 scales.
         fp32_scales = "0" if _is_blackwell(args) else "1"
-        misc_args += f"""--train-env-vars '{{"NVTE_FP8_BLOCK_SCALING_FP32_SCALES":"{fp32_scales}"}}' """
+        train_env_vars = {"NVTE_FP8_BLOCK_SCALING_FP32_SCALES": fp32_scales}
+        if args.nvfp4_experts:
+            train_env_vars |= _NVFP4_TRAIN_ENV_VARS
+        misc_args += f"--train-env-vars '{json.dumps(train_env_vars, separators=(',', ':'))}' "
         # Keep the DSA indexer weights_proj (a TELinear) in BF16 on the trainer: blockwise
         # fp8 on weights_proj is numerically unstable, so override it back to BF16 via TE.
+        # With nvfp4_experts, additionally override the routed-expert grouped GEMMs to NVFP4.
+        if args.nvfp4_experts:
+            te_precision_config = _DSV4_NVFP4_TE_PRECISION_CONFIG
+        else:
+            te_precision_config = _DSV4_FP8_TE_PRECISION_CONFIG
         if "--te-precision-config-file" not in args.extra_args:
-            misc_args += f"--te-precision-config-file " f"{U.save_to_temp_file(_DSV4_TE_PRECISION_CONFIG, 'yaml')} "
+            misc_args += f"--te-precision-config-file " f"{U.save_to_temp_file(te_precision_config, 'yaml')} "
 
     train_args = (
         f"{ckpt_args} "
@@ -622,6 +805,9 @@ def full_train(args: ScriptArgs):
         _prepare_single(args)
     else:
         print(f"[full_train] Skipping FP8->BF16 cast: {bf16_sentinel} already exists.")
+        if args.nvfp4_experts:
+            # BF16 cast may predate the NVFP4 conversion; this self-skips when done.
+            _convert_nvfp4_blockfp8(args)
 
     torch_dist_dir = Path(f"{args.model_dir}/{args.torch_dist_name}")
     torch_dist_sentinel = torch_dist_dir / "latest_checkpointed_iteration.txt"
@@ -636,7 +822,10 @@ def full_train(args: ScriptArgs):
         print(f"[full_train] Skipping rsync: model_local_dir == model_dir ({args.model_dir})")
 
     if args.hf_checkpoint is None:
-        args.hf_checkpoint = f"{args.model_local_dir}/{args.model_name}"
+        # With NVFP4 experts the rollout serves the converted mixed checkpoint;
+        # otherwise it serves the source FP8 checkpoint.
+        rollout_ckpt_name = args.nvfp4_name if args.nvfp4_experts else args.model_name
+        args.hf_checkpoint = f"{args.model_local_dir}/{rollout_ckpt_name}"
 
     _train(args)
 

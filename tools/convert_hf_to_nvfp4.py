@@ -147,7 +147,11 @@ def _quantize_nvfp4_1d(
     else:
         global_amax = global_amax.to(device=weight.device, dtype=torch.float32)
 
-    from transformer_engine.pytorch.custom_recipes.quantization_nvfp4 import NVFP4QuantizerRef
+    try:
+        # TE renamed the reference module quantization_nvfp4 -> quantization_ref_nvfp4.
+        from transformer_engine.pytorch.custom_recipes.quantization_ref_nvfp4 import NVFP4QuantizerRef
+    except ImportError:
+        from transformer_engine.pytorch.custom_recipes.quantization_nvfp4 import NVFP4QuantizerRef
 
     qweight, block_scale = NVFP4QuantizerRef._quantize_blockwise_reference(
         weight,
