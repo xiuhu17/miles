@@ -77,6 +77,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     megatron_model_type: str = "glm5.2-744B-A40B"
     num_gpus_per_node: int | None = None
     fp8_rollout: bool = False
+    # Trainer-side MXFP8 compute. Enabling fp8_param_gather changes TE GEMM
+    # weights from BF16 primary + MXFP8 workspace to MXFP8 primary storage.
+    train_mxfp8: bool = False
+    fp8_param_gather: bool = False
     use_deepep: bool = True
     megatron_use_deepep: bool = True
     enable_eval: bool = False
@@ -96,6 +100,13 @@ class ScriptArgs(U.ExecuteTrainConfig):
     hardware: Literal["auto", "H200", "B200", "GB300"] = "auto"
 
     def __post_init__(self):
+        if self.fp8_param_gather and not self.train_mxfp8:
+            raise ValueError("--fp8-param-gather requires --train-mxfp8 in this recipe")
+        if self.fp8_param_gather and self.fp8_rollout:
+            raise ValueError(
+                "--fp8-param-gather publishes native MXFP8 and cannot target the "
+                "legacy 128x128 --fp8-rollout checkpoint; leave --fp8-rollout disabled"
+            )
         self.hardware = U.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or U.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.hardware == "GB300":
@@ -124,6 +135,15 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
 def _is_pruned(args: ScriptArgs):
     return re.search(r"(\d+)layer", args.model_name) is not None
+
+
+def _get_trainer_precision_args(args: ScriptArgs) -> str:
+    if not args.train_mxfp8:
+        return ""
+    precision_args = "--transformer-impl transformer_engine --fp8-format e4m3 --fp8-recipe mxfp8 "
+    if args.fp8_param_gather:
+        precision_args += "--fp8-param-gather --reuse-grad-buf-for-mxfp8-param-ag "
+    return precision_args
 
 
 def _validate_glm_checkpoint(args: ScriptArgs):
@@ -342,6 +362,11 @@ def _execute_train(args: ScriptArgs):
         "--adam-beta2 0.98 "
     )
     if args.enable_optimizer_offload:
+        if args.fp8_param_gather:
+            raise ValueError(
+                "MXFP8 --fp8-param-gather is incompatible with the current HDO CPU optimizer path; "
+                "disable --enable-optimizer-offload for this experiment."
+            )
         optimizer_args += (
             "--optimizer-cpu-offload " "--overlap-cpu-optimizer-d2h-h2d " "--use-precision-aware-optimizer "
         )
@@ -370,6 +395,10 @@ def _execute_train(args: ScriptArgs):
         f"--sglang-ep-size {sglang_world_size} "
         "--sglang-router-policy consistent_hashing "
     )
+    if args.fp8_param_gather:
+        # Bootstrap SGLang from the canonical BF16 checkpoint, then keep its
+        # base weights in the same compact MXFP8 ABI that Megatron publishes.
+        sglang_args += "--sglang-quantization mxfp8 "
     if args.enable_pd:
         # slime native config
         sglang_args += (
@@ -457,6 +486,7 @@ def _execute_train(args: ScriptArgs):
         f"{grpo_args} "
         f"{U.get_default_wandb_args(__file__, run_id=args.run_id)} "
         f"{perf_args} "
+        f"{_get_trainer_precision_args(args)} "
         f"{eval_args} "
         f"{sglang_args} "
         f"{misc_args} "

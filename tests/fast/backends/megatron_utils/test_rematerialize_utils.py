@@ -10,18 +10,39 @@ from miles.backends.megatron_utils.rematerialize_utils import (
 
 
 class _FakeDistOpt:
-    def __init__(self):
-        self.copied = 0
+    def __init__(self, *, layer_wise=False):
+        self.model_copies = 0
+        self.buffer_copies = 0
+        self._layer_wise_non_distopt_child = layer_wise
 
     def _copy_main_params_to_model_params(self):
-        self.copied += 1
+        self.model_copies += 1
+
+    def _copy_main_params_to_param_buffer(self):
+        self.buffer_copies += 1
 
 
 def test_mcore_cast_calls_every_chained_optimizer():
     dist_opts = [_FakeDistOpt(), _FakeDistOpt()]
     cast = _build_cast_main_to_params_fn(SimpleNamespace(chained_optimizers=dist_opts), precision_aware=False)
     cast()
-    assert [opt.copied for opt in dist_opts] == [1, 1]
+    assert [opt.model_copies for opt in dist_opts] == [1, 1]
+    assert [opt.buffer_copies for opt in dist_opts] == [0, 0]
+
+
+def test_mxfp8_reuse_stages_distopt_and_direct_copies_layerwise_child():
+    distopt = _FakeDistOpt()
+    layer_wise = _FakeDistOpt(layer_wise=True)
+    cast = _build_cast_main_to_params_fn(
+        SimpleNamespace(chained_optimizers=[distopt, layer_wise]),
+        precision_aware=False,
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+    )
+
+    cast()
+
+    assert (distopt.buffer_copies, distopt.model_copies) == (1, 0)
+    assert (layer_wise.buffer_copies, layer_wise.model_copies) == (0, 1)
 
 
 def test_hdo_replay_covers_both_fractions():

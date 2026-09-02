@@ -650,8 +650,19 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         index_k = gather_from_sequence_parallel_region(index_k, group=parallel_state.get_context_parallel_group())
         index_k = index_k.unsqueeze(1)  # [total_tokens, 1, head_dim]
 
-        # head_weights, _ = self.weights_proj(hidden_states.float())
-        head_weights = WeightLinearFunction.apply(hidden_states, self.weights_proj.weight, None, torch.float32)
+        # ``te_general_gemm`` cannot mix a native MXFP8 primary weight with a
+        # plain BF16 input (TE represents the latter with delayed tensor
+        # scaling).  The existing torch fallback dequantizes just this small
+        # indexer projection for the matmul while preserving the MXFP8 primary
+        # parameter, FP32 output, and full-precision weight gradient.
+        use_torch_mm = bool(getattr(self.config, "fp8_param", False))
+        head_weights = WeightLinearFunction.apply(
+            hidden_states,
+            self.weights_proj.weight,
+            None,
+            torch.float32,
+            use_torch_mm,
+        )
         head_weights = head_weights.squeeze(1) * (
             (self.config.index_num_attention_heads**-0.5) * (self.config.index_head_dim**-0.5)
         )  # [total_tokens, index_num_attention_heads_per_partition]

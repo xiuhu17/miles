@@ -92,5 +92,5 @@ async def test_critic_role_disables_reward_kl_and_preserves_actor_args(monkeypat
     assert critic.args is not args
     assert critic.args.kl_coef == 0
     assert critic.args.use_opd is False
-    assert critic.args.disable_param_buffers_cpu_backup is False
+    assert critic.args.disable_param_buffers_cpu_backup is True
     assert critic.with_ref is False

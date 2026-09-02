@@ -374,7 +374,6 @@ def _apply_lm_head_lora(model, args, *, scale: float, dropout: float, a_init: st
 def apply_inkling_lora(model, args):
     """Attach Inkling LoRA to ONE built model chunk (before Float16Module / DDP wrapping)."""
     from miles.backends.megatron_utils.lora_utils import patch_param_grad_buffer_for_colocate_mode_lora
-
     from miles_plugins.models.inkling.layers import InklingDenseMLP, InklingSelfAttention, InklingSharedExperts
 
     if args.offload_train:
@@ -431,7 +430,11 @@ def wrap_model_provider_with_inkling_lora(provider_func, args):
     """Wrap a miles model provider so every built chunk gets LoRA before DDP wrap."""
 
     def wrapped(*provider_args, **provider_kwargs):
-        return apply_inkling_lora(provider_func(*provider_args, **provider_kwargs), args)
+        from miles.backends.megatron_utils.param_backup_ownership import lora_adapter_allocation_region
+
+        model = provider_func(*provider_args, **provider_kwargs)
+        with lora_adapter_allocation_region(args):
+            return apply_inkling_lora(model, args)
 
     return wrapped
 

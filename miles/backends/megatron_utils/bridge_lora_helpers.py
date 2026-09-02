@@ -10,12 +10,14 @@ import logging
 from argparse import Namespace
 from dataclasses import dataclass
 
+import torch
 from megatron.core.utils import get_attr_wrapped_model
 
 from miles.utils.hf_config import load_hf_config
 from miles.utils.multi_lora import is_multi_lora_enabled, targets_expert_leaves
 
 from .lora_utils import convert_target_modules_to_hf, patch_param_grad_buffer_for_colocate_mode_lora
+from .model_provider import _apply_bridge_runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,62 @@ def _make_value_model_hook(hidden_size: int):
 
 def _get_model_config_from_wrapped(model):
     return get_attr_wrapped_model(model, "config", allow_none=False)
+
+
+def _clear_frozen_high_precision_init_values(model_chunks) -> tuple[int, int]:
+    """Drop TE's CPU high-precision init copies for frozen LoRA base weights.
+
+    Trainable quantized parameters consume these copies when their FP32 optimizer
+    masters are built.  Frozen LoRA base parameters have no master, so retaining
+    the copies would leave a hidden BF16 base backup on CPU for the lifetime of
+    the trainer.
+    """
+    cleared_params = 0
+    cleared_bytes = 0
+    seen_params: set[int] = set()
+    for model_chunk in _ensure_model_list(model_chunks):
+        for param in model_chunk.parameters():
+            param_id = id(param)
+            if param_id in seen_params or param.requires_grad:
+                continue
+            seen_params.add(param_id)
+
+            get_init_value = getattr(param, "get_high_precision_init_val", None)
+            clear_init_value = getattr(param, "clear_high_precision_init_val", None)
+            if not callable(get_init_value) or not callable(clear_init_value):
+                continue
+            init_value = get_init_value()
+            if init_value is None:
+                continue
+            cleared_params += 1
+            cleared_bytes += init_value.numel() * init_value.element_size()
+            clear_init_value()
+
+    if cleared_params:
+        logger.info(
+            "Cleared TE high-precision init backups for %d frozen LoRA parameters (%.2f GiB)",
+            cleared_params,
+            cleared_bytes / 1024**3,
+        )
+    return cleared_params, cleared_bytes
+
+
+def _freeze_lora_base_persistent_state(model_chunks) -> int:
+    """Keep mutable base-only buffers equal to rollout's independently owned base."""
+    frozen_biases = 0
+    for model_chunk in _ensure_model_list(model_chunks):
+        for module in model_chunk.modules():
+            if hasattr(module, "frozen_expert_bias") and isinstance(
+                getattr(module, "expert_bias", None), torch.Tensor
+            ):
+                module.frozen_expert_bias = True
+                frozen_biases += 1
+    if frozen_biases:
+        logger.info(
+            "Froze %d LoRA-base router expert_bias buffers; rollout owns its base",
+            frozen_biases,
+        )
+    return frozen_biases
 
 
 def _validate_multi_lora_moe_support(args: Namespace, provider) -> None:
@@ -131,20 +189,9 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
     bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
     provider = bridge.to_megatron_provider(load_weights=False)
 
-    provider.tensor_model_parallel_size = args.tensor_model_parallel_size
-    provider.pipeline_model_parallel_size = args.pipeline_model_parallel_size
-    provider.expert_model_parallel_size = args.expert_model_parallel_size
-    provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
-    provider.sequence_parallel = args.sequence_parallel
-    provider.virtual_pipeline_model_parallel_size = args.virtual_pipeline_model_parallel_size
-    provider.context_parallel_size = args.context_parallel_size
-    provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
-    provider.recompute_granularity = args.recompute_granularity
-    provider.recompute_method = args.recompute_method
-    provider.recompute_num_layers = args.recompute_num_layers
-    provider.recompute_modules = args.recompute_modules
-    provider.distribute_saved_activations = args.distribute_saved_activations
-    provider.attention_backend = args.attention_backend
+    _apply_bridge_runtime_config(provider, args)
+    # Packed RL batches and the current Bridge LoRA MoE path deliberately use
+    # these values regardless of the generic Megatron defaults.
     provider.variable_seq_lengths = True
     provider.moe_token_dispatcher_type = "alltoall"
     provider.moe_router_load_balancing_type = "none"
@@ -157,12 +204,6 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
                 "dispatcher's permutation, which the fused kernel does not expose"
             )
         provider.moe_permute_fusion = False
-    if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
-        provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
-    if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
-        provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
-    if hasattr(provider, "dsa_attention_backend"):
-        provider.dsa_attention_backend = getattr(args, "dsa_attention_backend", "megatron")
     provider.finalize()
 
     if is_multi_lora_enabled(args):
@@ -177,7 +218,12 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
         lora = create_lora_instance(args)
 
     def apply_lora_hook(model_chunks):
-        transformed = lora(model_chunks, training=True)
+        # The enclosing model-build region is TMS-backed for the frozen base.
+        # Override it exactly while Bridge allocates trainable adapter storage.
+        from .param_backup_ownership import lora_adapter_allocation_region
+
+        with lora_adapter_allocation_region(args):
+            transformed = lora(model_chunks, training=True)
         lora.set_params_to_save(transformed)
         return transformed
 
@@ -199,6 +245,11 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
     ddp_config = DistributedDataParallelConfig(
         use_distributed_optimizer=use_distributed_optimizer,
         grad_reduce_in_fp32=args.accumulate_allreduce_grads_in_fp32,
+        overlap_grad_reduce=args.overlap_grad_reduce,
+        overlap_param_gather=args.overlap_param_gather,
+        align_param_gather=args.align_param_gather,
+        fp8_param_gather=args.fp8_param_gather,
+        reuse_grad_buf_for_mxfp8_param_ag=args.reuse_grad_buf_for_mxfp8_param_ag,
     )
     ddp_config.finalize()
 

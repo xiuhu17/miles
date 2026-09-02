@@ -4,6 +4,24 @@ import pytest
 import requests
 
 
+def test_begin_weight_update_forwards_native_mxfp8_session_format():
+    pytest.importorskip("sglang")
+    from miles.backends.sglang_utils.sglang_engine import SGLangEngine
+
+    engine = SGLangEngine.__new__(SGLangEngine)
+    calls = []
+    engine._make_request = lambda endpoint, payload: calls.append((endpoint, payload))
+
+    engine.begin_weight_update(selector="target", weight_format="native_mxfp8")
+
+    assert calls == [
+        (
+            "begin_weight_update",
+            {"selector": "target", "weight_format": "native_mxfp8"},
+        )
+    ]
+
+
 def test_flush_cache_sleeps_between_pending_request_retries(monkeypatch):
     """Regression test for the fully_async weight-update crash: sglang
     returns 400 (not an exception) while requests are still pending, so the

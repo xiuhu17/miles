@@ -4,6 +4,7 @@ import dataclasses
 import gc
 import logging
 import math
+import os
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
@@ -31,7 +32,7 @@ from miles.backends.megatron_utils.local_weight_checksum import dump_local_weigh
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.audit_utils.witness.module import witness_dump_and_clear_stale
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
-from miles.utils.memory_utils import clear_memory
+from miles.utils.memory_utils import clear_memory, print_memory
 from miles.utils.multi_lora import is_multi_lora_enabled
 from miles.utils.test_utils.ft_test_actions import FTTestActionActorExecutor
 from miles.utils.tracking_utils.structured_log import log_structured
@@ -53,6 +54,7 @@ from .initialize import is_first_replica_megatron_main_rank
 from .lora_utils import is_lora_enabled, is_lora_model
 from .model_provider import get_model_provider_func
 from .parallel import get_packed_seq_params
+from .param_backup_ownership import primary_model_allocation_region
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +64,12 @@ def _has_loadable_ckpt(load_dir: str | None) -> bool:
     return bool(load_dir) and Path(load_dir).is_dir() and any(Path(load_dir).iterdir())
 
 
-from .bridge_lora_helpers import _ensure_model_list, _setup_lora_model_via_bridge  # noqa: F401
+from .bridge_lora_helpers import (  # noqa: F401
+    _clear_frozen_high_precision_init_values,
+    _ensure_model_list,
+    _freeze_lora_base_persistent_state,
+    _setup_lora_model_via_bridge,
+)
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
@@ -143,23 +150,31 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
-    # Multi-LoRA and single-LoRA (actor, bridge) both build via the bridge helper,
-    # which picks the adapter type internally.
-    if is_multi_lora_enabled(args) or (
-        is_lora_enabled(args) and role == "actor" and args.megatron_to_hf_mode == "bridge"
-    ):
-        model = _setup_lora_model_via_bridge(args)
-    else:
-        provider_func = get_model_provider_func(args, role)
-        if (
-            is_lora_enabled(args)
-            and role == "actor"
-            and "inkling" in (getattr(args, "custom_model_provider_path", None) or "")
+    with primary_model_allocation_region(args, role):
+        # Multi-LoRA and single-LoRA (actor, bridge) both build via the bridge helper,
+        # which picks the adapter type internally.
+        if is_multi_lora_enabled(args) or (
+            is_lora_enabled(args) and role == "actor" and args.megatron_to_hf_mode == "bridge"
         ):
-            from miles_plugins.models.inkling.lora import wrap_model_provider_with_inkling_lora
+            model = _setup_lora_model_via_bridge(args)
+        else:
+            provider_func = get_model_provider_func(args, role)
+            if (
+                is_lora_enabled(args)
+                and role == "actor"
+                and "inkling" in (getattr(args, "custom_model_provider_path", None) or "")
+            ):
+                from miles_plugins.models.inkling.lora import wrap_model_provider_with_inkling_lora
 
-            provider_func = wrap_model_provider_with_inkling_lora(provider_func, args)
-        model = get_model(provider_func, ModelType.encoder_or_decoder)
+                provider_func = wrap_model_provider_with_inkling_lora(provider_func, args)
+            model = get_model(provider_func, ModelType.encoder_or_decoder)
+
+    if role == "actor" and is_lora_enabled(args):
+        # Frozen quantized bases have no optimizer master to consume TE's
+        # high-precision init copy. Clear it for every model-provider path,
+        # including non-Bridge custom LoRA providers.
+        _freeze_lora_base_persistent_state(model)
+        _clear_frozen_high_precision_init_values(model)
 
     if args.debug_disable_optimizer:
         if is_first_replica_megatron_main_rank():
@@ -464,6 +479,16 @@ def train_one_step(
     else:
         _zero_grads(model, optimizer, disable_optimizer)
 
+    memory_benchmark = os.environ.get("MILES_MEMORY_BENCHMARK", "0") == "1"
+    if memory_benchmark:
+        # compute_log_prob has already exercised the model and created any lazy
+        # persistent FP8 weight workspace. Clear disposable cache and reset the
+        # peak here so this reports steady training residency plus the F/B peak,
+        # independently from checkpoint/model startup.
+        clear_memory()
+        torch.cuda.reset_peak_memory_stats()
+        print_memory(f"benchmark before forward/backward rollout={rollout_id} step={step_id}")
+
     if args.custom_megatron_before_train_step_hook_path:
         from miles.utils.misc import load_function
 
@@ -575,6 +600,8 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+    if memory_benchmark:
+        print_memory(f"benchmark after forward/backward rollout={rollout_id} step={step_id}")
 
     outcome = TrainStepOutcome.NORMAL
     grad_norm = 0.0
@@ -634,10 +661,18 @@ def train_one_step(
             assert update_successful
             opt_param_scheduler.step(increment=num_rollouts)
 
+    if memory_benchmark:
+        print_memory(f"benchmark after optimizer step rollout={rollout_id} step={step_id}")
+
     # release grad (multi-LoRA retains accumulated grads; stepped slots were
     # zeroed selectively inside step_adapter_slots)
     if not multi_lora:
         _zero_grads(model, optimizer, disable_optimizer)
+    if memory_benchmark:
+        print_memory(
+            f"benchmark steady after first train step rollout={rollout_id} step={step_id}",
+            clear_before_print=True,
+        )
 
     log_structured(
         logger.info,
@@ -986,7 +1021,10 @@ def initialize_model_and_optimizer(
                 optimizer.reload_model_params()
 
     check_peak_gpu_memory_after_load(args)
-    clear_memory()
+    if os.environ.get("MILES_MEMORY_BENCHMARK", "0") == "1":
+        print_memory("after load model and optimizer", clear_before_print=True)
+    else:
+        clear_memory()
 
     check_model_hashes(args, model, iteration)
 

@@ -128,10 +128,22 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # rollout-side fp8 checkpoint; defaults to <hf_checkpoint>_fp8 (e.g. GLM-5.2_fp8).
     fp8_rollout_checkpoint: str | None = None
 
+    # Trainer-side MXFP8 compute. With fp8_param_gather=True, TE GEMM base
+    # weights are MXFP8 primary storage instead of BF16 + an MXFP8 workspace.
+    train_mxfp8: bool = False
+    fp8_param_gather: bool = False
+
     enable_wandb: bool = True
     extra_args: str = ""
 
     def __post_init__(self):
+        if self.fp8_param_gather and not self.train_mxfp8:
+            raise ValueError("--fp8-param-gather requires --train-mxfp8 in this recipe")
+        if self.fp8_param_gather and self.fp8_rollout:
+            raise ValueError(
+                "--fp8-param-gather uses an online MXFP8 rollout base and cannot be "
+                "combined with the legacy pre-converted --fp8-rollout checkpoint"
+            )
         if self.hf_checkpoint is None:
             self.hf_checkpoint = f"{self.model_dir}/{self.model_name}"
         if self.fp8_rollout and self.fp8_rollout_checkpoint is None:
@@ -161,6 +173,15 @@ def _get_parallel_config(args: ScriptArgs) -> str:
         f"--context-parallel-size 1 --expert-model-parallel-size {ngpu} --expert-tensor-parallel-size 1 "
         f"--qkv-format {qkv_format} --micro-batch-size 1 "
     )
+
+
+def _get_trainer_precision_args(args: ScriptArgs) -> str:
+    if not args.train_mxfp8:
+        return ""
+    precision_args = "--transformer-impl transformer_engine --fp8-format e4m3 --fp8-recipe mxfp8 "
+    if args.fp8_param_gather:
+        precision_args += "--fp8-param-gather --reuse-grad-buf-for-mxfp8-param-ag "
+    return precision_args
 
 
 def _download_dataset(args: ScriptArgs):
@@ -246,6 +267,11 @@ def _train(args: ScriptArgs):
     )
     # the three CPU-Adam flags go together; OPTIMIZER_CPU_OFFLOAD=0 to disable
     if os.environ.get("OPTIMIZER_CPU_OFFLOAD", "1") != "0":
+        if args.fp8_param_gather:
+            raise ValueError(
+                "MXFP8 --fp8-param-gather is incompatible with the current HDO CPU optimizer path; "
+                "set OPTIMIZER_CPU_OFFLOAD=0 for this experiment."
+            )
         optimizer_args += "--optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d --use-precision-aware-optimizer "
 
     perf_args = _get_parallel_config(args)
@@ -290,6 +316,10 @@ def _train(args: ScriptArgs):
                 f"        num_gpus: {args.num_gpus_per_node}\n"
             )
         sglang_args += f"--sglang-config {sglang_config_path} "
+    elif args.fp8_param_gather:
+        # The trainer never republishes the frozen base; SGLang owns this
+        # independently quantized MXFP8 base and only receives adapter updates.
+        sglang_args += "--sglang-quantization mxfp8 "
 
     save_args = f"--save-interval 1 --save {load_save_path} "
 
@@ -301,7 +331,8 @@ def _train(args: ScriptArgs):
         f"--seq-length {args.seq_window} --rollout-max-context-len {args.seq_window} " if args.seq_window > 0 else ""
     )
 
-    train_args = f"{ckpt_args} {lora_args} {rollout_args} {seq_args} {optimizer_args} {grpo_args} {r3_args} {wandb_args} {perf_args} {sglang_args} {save_args} {misc_args} {args.extra_args} "
+    trainer_precision_args = _get_trainer_precision_args(args)
+    train_args = f"{ckpt_args} {lora_args} {rollout_args} {seq_args} {optimizer_args} {grpo_args} {r3_args} {wandb_args} {perf_args} {trainer_precision_args} {sglang_args} {save_args} {misc_args} {args.extra_args} "
 
     U.execute_train(
         train_args=train_args,

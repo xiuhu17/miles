@@ -2,7 +2,6 @@
 import argparse
 import inspect
 import logging
-from contextlib import nullcontext
 from typing import Literal
 
 import torch
@@ -22,6 +21,38 @@ from miles.utils.misc import load_function
 from miles.utils.replay_base import routing_replay_manager
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_bridge_fp8_runtime_config(provider, args: argparse.Namespace) -> None:
+    """Propagate trainer-side FP8 primary-storage settings into Bridge.
+
+    ``core_transformer_config_from_args`` performs this mapping for the native
+    Megatron provider.  Bridge constructs its transformer config directly from
+    the HF checkpoint, so these runtime-only fields otherwise stay at their
+    defaults and ``--fp8-param-gather`` keeps a BF16 primary weight.
+    """
+    provider.fp8 = args.fp8
+    provider.fp8_recipe = args.fp8_recipe
+
+    if not hasattr(provider, "fp8_param"):
+        if args.fp8_param_gather:
+            raise RuntimeError(
+                "The installed Megatron-Bridge provider does not expose fp8_param; "
+                "it cannot honor --fp8-param-gather safely."
+            )
+        return
+
+    provider.fp8_param = args.fp8_param_gather
+    for field_name in (
+        "fp8_wgrad",
+        "fp8_output_proj",
+        "tp_only_amax_red",
+        "first_last_layers_bf16",
+        "num_layers_at_start_in_bf16",
+        "num_layers_at_end_in_bf16",
+    ):
+        if hasattr(args, field_name) and hasattr(provider, field_name):
+            setattr(provider, field_name, getattr(args, field_name))
 
 
 def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
@@ -44,6 +75,7 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
     provider.sequence_parallel = args.sequence_parallel
     provider.context_parallel_size = args.context_parallel_size
+    provider.virtual_pipeline_model_parallel_size = getattr(args, "virtual_pipeline_model_parallel_size", None)
 
     # loss / sequence handling
     provider.calculate_per_token_loss = args.calculate_per_token_loss  # CP>1 VL models assert this
@@ -71,9 +103,8 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     # communication overlap
     provider.tp_comm_overlap = args.tp_comm_overlap
 
-    # fp8
-    provider.fp8 = args.fp8
-    provider.fp8_recipe = args.fp8_recipe
+    # fp8 compute + quantized primary storage
+    _apply_bridge_fp8_runtime_config(provider, args)
 
     # attention kernel selection
     provider.attention_backend = args.attention_backend
@@ -263,23 +294,6 @@ def get_model_provider_func(
                         kitchen_attention_backend=config.kitchen_attention_backend,
                     )
 
-        build_model_context = nullcontext
-        build_model_context_args = {}
-        if args.fp8_param_gather:
-            try:
-                from transformer_engine.pytorch import fp8_model_init
-
-                build_model_context = fp8_model_init
-                build_model_context_args["enabled"] = True
-
-                # Check if fp8_model_init supports preserve_high_precision_init_val
-                if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
-                    build_model_context_args["preserve_high_precision_init_val"] = True
-            except Exception as e:
-                raise RuntimeError(
-                    "--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found."
-                ) from e
-
         kwargs = {
             "config": config,
             "transformer_layer_spec": transformer_layer_spec,
@@ -322,8 +336,11 @@ def get_model_provider_func(
                 # restore instead of forcing True: the critic role keeps the manager disabled
                 routing_replay_manager.enabled = prev_routing_replay_enabled
 
-        with build_model_context(**build_model_context_args):
-            model = GPTModel(**kwargs)
+        # Megatron enters a recipe-aware quantized-model-init context for each
+        # transformer layer via get_fp8_context(..., is_init=True).  An outer
+        # recipe-less TE context is both redundant and wrong for MXFP8: it can
+        # quantize modules outside those layer contexts with TE's default recipe.
+        model = GPTModel(**kwargs)
 
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)

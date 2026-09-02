@@ -2881,6 +2881,26 @@ def _validate_rematerialize_param_from_master_weight(args):
         args.check_rematerialize_param_from_master_weight = True
 
 
+def _validate_native_mxfp8_param_gather(args) -> None:
+    """Fail closed outside the first native-primary publish capability set."""
+    if not getattr(args, "fp8_param_gather", False):
+        return
+
+    if getattr(args, "fp8_recipe", None) != "mxfp8":
+        raise ValueError("MILES native --fp8-param-gather currently supports --fp8-recipe mxfp8 only")
+    if getattr(args, "fp4_param_gather", False) or getattr(args, "fp4_param", False):
+        raise ValueError("NVFP4/FP4 primary storage is outside the native MXFP8 v1 scope")
+    if not getattr(args, "colocate", False):
+        raise ValueError(
+            "native MXFP8 --fp8-param-gather currently requires --colocate; "
+            "distributed/RDT component-aware publish is not implemented"
+        )
+    if not is_lora_enabled(args) and getattr(args, "megatron_to_hf_mode", None) != "raw":
+        raise ValueError("full-parameter native MXFP8 publish requires --megatron-to-hf-mode raw")
+    if getattr(args, "optimizer_cpu_offload", False):
+        raise ValueError("MXFP8 --fp8-param-gather is incompatible with the current HDO CPU optimizer path")
+
+
 def miles_validate_args(args):
     validate_dashboard_args(args)
 
@@ -3302,6 +3322,18 @@ def miles_validate_args(args):
     ):
         args.check_weight_update_equal = True
 
+    if is_lora_enabled(args) and args.check_weight_update_equal:
+        # The base checker snapshots and poisons every rollout weight, which
+        # necessarily requires a full base republish. LoRA's frozen base is
+        # rollout-owned and intentionally never sent by the trainer; validate
+        # the adapter transport instead.
+        logger.warning(
+            "LoRA does not use --check-weight-update-equal because the frozen base is not "
+            "republished; enabling --check-lora-weight-equal instead"
+        )
+        args.check_weight_update_equal = False
+        args.check_lora_weight_equal = True
+
     # always true on offload for colocate at the moment.
     if args.update_weight_transfer_mode == "rdt":
         assert args.train_backend == "megatron", "RDT weight transfer is only supported with --train-backend megatron."
@@ -3385,6 +3417,7 @@ def miles_validate_args(args):
         args.disable_grad_buffers_cpu_backup = True
         args.disable_param_buffers_cpu_backup = True
 
+    _validate_native_mxfp8_param_gather(args)
     _validate_rematerialize_param_from_master_weight(args)
 
     if (args.offload_train_target == "disk" or args.stream_optimizer_state_to_disk) and (

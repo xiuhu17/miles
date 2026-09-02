@@ -7,6 +7,11 @@ class HfWeightIteratorBase(ABC):
         from .hf_weight_iterator_bridge import HfWeightIteratorBridge
         from .hf_weight_iterator_direct import HfWeightIteratorDirect
 
+        if getattr(args, "fp8_param_gather", False) and not kwargs.get("is_lora", False):
+            from .hf_weight_iterator_native_mxfp8 import HfWeightIteratorNativeMXFP8
+
+            return HfWeightIteratorNativeMXFP8(args, model, **kwargs)
+
         c = {
             "raw": HfWeightIteratorDirect,
             "bridge": HfWeightIteratorBridge,

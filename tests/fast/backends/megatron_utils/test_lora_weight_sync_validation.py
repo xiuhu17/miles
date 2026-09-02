@@ -24,7 +24,10 @@ from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.
 from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.mixin import (
     DistBucketedWeightUpdateMixin,
 )
-from miles.backends.megatron_utils.update_weight.update_weight_from_tensor import UpdateWeightFromTensor
+from miles.backends.megatron_utils.update_weight.update_weight_from_tensor import (
+    UpdateWeightFromTensor,
+    _rollout_owns_lora_base,
+)
 from miles.utils.lora import LORA_ADAPTER_NAME
 
 _UW_MODULE = "miles.backends.megatron_utils.update_weight.update_weight_from_tensor"
@@ -240,6 +243,86 @@ class TestUpdateWeightsZeroChunks:
         updater.use_distribute = False
 
         updater.update_weights()
+
+
+class TestLoraBaseOwnership:
+    def test_offloaded_colocated_rollout_requires_its_own_base_backup(self):
+        args = _make_args(colocate=True, offload_rollout=True, lora_base_cpu_backup=False)
+        assert not _rollout_owns_lora_base(args)
+
+    @patch(f"{_UW_MODULE}.dist")
+    @patch(f"{_UW_MODULE}.HfWeightIteratorBase")
+    def test_updater_rejects_missing_rollout_recovery_source(self, mock_iter_base, mock_dist):
+        mock_dist.get_world_size.return_value = 1
+        mock_dist.get_rank.return_value = 0
+        mock_dist.new_group.return_value = MagicMock()
+        mock_iter_base.create.return_value = MagicMock()
+
+        args = _make_args(colocate=True, offload_rollout=True, lora_base_cpu_backup=False)
+        with pytest.raises(ValueError, match="lora-base-cpu-backup"):
+            UpdateWeightFromTensor(
+                args=args,
+                model=[MagicMock()],
+                weights_getter=lambda: {},
+                model_name="qwen",
+                quantization_config=None,
+                is_lora=True,
+            )
+
+    @patch(f"{_UW_MODULE}._pp_assemble_full_adapter", side_effect=lambda tensors: tensors)
+    @patch("miles.backends.megatron_utils.update_weight.common.ray")
+    @patch(f"{_UW_MODULE}.get_gloo_group", return_value=MagicMock())
+    @patch(f"{_UW_MODULE}.ray")
+    @patch(f"{_UW_MODULE}.dist")
+    @patch(f"{_UW_MODULE}.HfWeightIteratorBase")
+    def test_check_equal_does_not_read_or_republish_frozen_base(
+        self,
+        mock_iter_base,
+        mock_dist,
+        mock_ray,
+        _mock_gloo,
+        _mock_common_ray,
+        _mock_pp_assemble,
+    ):
+        mock_dist.get_world_size.return_value = 1
+        mock_dist.get_rank.return_value = 0
+        mock_dist.new_group.return_value = MagicMock()
+
+        calls = []
+
+        def chunks(weights, weight_type):
+            calls.append((weights, weight_type))
+            if weight_type == "lora":
+                yield SAMPLE_LORA_WEIGHTS
+
+        iterator = MagicMock()
+        iterator.get_hf_weight_chunks.side_effect = chunks
+        mock_iter_base.create.return_value = iterator
+        weights_getter = MagicMock(side_effect=AssertionError("frozen base getter must not run"))
+
+        updater = UpdateWeightFromTensor(
+            args=_make_args(
+                colocate=True,
+                offload_rollout=True,
+                lora_base_cpu_backup=True,
+                check_weight_update_equal=True,
+            ),
+            model=[MagicMock()],
+            weights_getter=weights_getter,
+            model_name="qwen",
+            quantization_config=None,
+            is_lora=True,
+        )
+        updater.rollout_engines = [MagicMock()]
+        updater.use_distribute = False
+        updater._send_lora_params = MagicMock(return_value=([], []))
+
+        with patch.object(torch.cuda, "ipc_collect"), patch.object(torch.cuda, "empty_cache"):
+            updater.update_weights()
+
+        weights_getter.assert_not_called()
+        assert calls == [({}, "lora")]
+        updater._send_lora_params.assert_called_once_with(SAMPLE_LORA_WEIGHTS)
 
 
 # ---------------------------------------------------------------------------

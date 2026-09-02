@@ -6,10 +6,31 @@ from miles.utils.mxfp8 import mxfp8_quantize
 def quantize_params_mxfp8(args, megatron_name, converted_named_params, quantization_config):
     assert quantization_config["quant_method"] == "mxfp8"
 
+    if not should_quantize_param_mxfp8(args, megatron_name):
+        return converted_named_params
+
+    quantize_named_params = []
+    for converted_name, param in converted_named_params:
+        # Some legacy expert converters may emit auxiliary high-precision
+        # scales. Native MXFP8 publish never enters this function, but preserve
+        # the established BF16->MXFP8 behavior for the legacy path.
+        if ".mlp.experts." in megatron_name and converted_name.endswith("_scale"):
+            continue
+        quantize_named_params.extend(_quantize_param(converted_name, param))
+    return quantize_named_params
+
+
+def should_quantize_param_mxfp8(args, megatron_name: str) -> bool:
+    """Whether the SGLang MXFP8 loader expects this Megatron weight quantized.
+
+    Native publish and legacy BF16->MXFP8 quantization share this exact routing
+    predicate so they cannot silently disagree about a module's representation.
+    """
+
     if getattr(args, "extra_high_precision_layers_megatron", False):
         for layer_name in getattr(args, "extra_high_precision_layers_megatron", ()):
             if layer_name in megatron_name:
-                return converted_named_params
+                return False
 
     decoder_layers_pattern = r"decoder\.layers\.(\d+)\.(.+)"
     match = re.search(decoder_layers_pattern, megatron_name)
@@ -19,7 +40,7 @@ def quantize_params_mxfp8(args, megatron_name, converted_named_params, quantizat
         mtp_layer_pattern = r"mtp\.layers\.(\d+)\.(.+)"
         match = re.search(mtp_layer_pattern, megatron_name)
         if not match:
-            return converted_named_params
+            return False
         layer_idx, rest = match.groups()
         rest = rest.replace("transformer_layer.", "").replace("mtp_model_layer.", "")
     else:
@@ -33,7 +54,7 @@ def quantize_params_mxfp8(args, megatron_name, converted_named_params, quantizat
         head_end_idx = num_layers_at_start_in_bf16
         tail_start_idx = num_layers - num_layers_at_end_in_bf16
         if int(layer_idx) < head_end_idx or int(layer_idx) >= tail_start_idx:
-            return converted_named_params
+            return False
 
     # experts
     expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
@@ -44,15 +65,7 @@ def quantize_params_mxfp8(args, megatron_name, converted_named_params, quantizat
             "linear_fc1",
             "linear_fc2",
         ]:
-            quantize_named_params = []
-            for converted_name, param in converted_named_params:
-                # skip bf16 weight_scale and input_scale
-                # TODO: find a clearer way.
-                if converted_name.endswith("_scale"):
-                    continue
-                quantize_named_params.extend(_quantize_param(converted_name, param))
-
-            return quantize_named_params
+            return True
 
     # shared expert
     shared_expert_pattern = r"mlp.shared_experts\.(.+)"
@@ -63,11 +76,7 @@ def quantize_params_mxfp8(args, megatron_name, converted_named_params, quantizat
             "linear_fc1.weight",
             "linear_fc2.weight",
         ]:
-            quantize_named_params = []
-            for converted_name, param in converted_named_params:
-                quantize_named_params.extend(_quantize_param(converted_name, param))
-
-            return quantize_named_params
+            return True
 
     mxfp8_param_names = [
         "self_attention.linear_proj.weight",
@@ -97,14 +106,9 @@ def quantize_params_mxfp8(args, megatron_name, converted_named_params, quantizat
         )
 
     if rest in mxfp8_param_names:
-        quantize_named_params = []
-        for converted_name, param in converted_named_params:
-            quantize_named_params.extend(_quantize_param(converted_name, param))
+        return True
 
-        return quantize_named_params
-
-    # for other parameters, we just return the original converted_named_params
-    return converted_named_params
+    return False
 
 
 def _quantize_param(name, weight):

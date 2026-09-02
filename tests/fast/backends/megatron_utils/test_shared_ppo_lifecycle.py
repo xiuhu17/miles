@@ -176,6 +176,7 @@ def test_save_model_does_not_manage_lifecycle(actor_module, monkeypatch):
 @pytest.mark.parametrize("asleep", [False, True])
 def test_update_weights_only_uses_temporary_process_groups_when_asleep(actor_module, monkeypatch, asleep):
     worker = object.__new__(actor_module.MegatronTrainRayActor)
+    worker.role = "actor"
     worker.args = Namespace(
         debug_rollout_only=False,
         debug_skip_weight_update=True,
@@ -212,8 +213,13 @@ def _lifecycle_worker(actor_module, monkeypatch, asleep):
         offload_train=True,
         rematerialize_param_from_master_weight=False,
         clear_quantized_weight_workspaces_on_offload=False,
+        lora_rank=0,
+        lora_adapter_path=None,
     )
+    worker.role = "actor"
     worker._asleep = asleep
+    worker._active_model_tag = "actor"
+    worker.weights_backuper = Mock()
     saver = Mock()
     reload_groups = Mock()
     monkeypatch.setattr(actor_module, "torch_memory_saver", saver)
@@ -255,6 +261,74 @@ def test_wake_up_resumes_offloaded_model_once(actor_module, monkeypatch):
     worker.wake_up()
 
     assert saver.resume.call_count == 1
+    worker.weights_backuper.restore.assert_called_once_with("actor")
+    assert worker._asleep is False
+
+
+def test_wake_up_reloads_process_groups_before_main_cast_restore(actor_module, monkeypatch):
+    worker, _saver, reload_groups = _lifecycle_worker(actor_module, monkeypatch, asleep=True)
+    order = []
+    reload_groups.side_effect = lambda: order.append("reload_groups")
+    worker.weights_backuper.restore.side_effect = lambda _tag: order.append("restore")
+
+    worker.wake_up()
+
+    assert order == ["reload_groups", "restore"]
+
+
+def test_remat_mxfp8_sleep_drops_shared_gradient_staging(actor_module, monkeypatch):
+    worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=False)
+    worker.role = "actor"
+    worker.args.rematerialize_param_from_master_weight = True
+    worker.args.reuse_grad_buf_for_mxfp8_param_ag = True
+
+    worker.sleep()
+
+    assert [call.kwargs["tag"] for call in saver.pause.call_args_list] == [
+        "grad_buffer",
+        "shared_param_grad_buffer",
+        "default",
+    ]
+
+
+def test_remat_mxfp8_publish_completion_drops_native_primary(actor_module, monkeypatch):
+    worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=True)
+    worker.role = "actor"
+    worker.args.fp8_param_gather = True
+    worker.args.lora_rank = 0
+    worker.args.lora_adapter_path = None
+
+    worker._pause_rematerialized_primary()
+
+    assert [call.kwargs["tag"] for call in saver.pause.call_args_list] == [
+        "param_buffer",
+        "primary_no_backup",
+    ]
+
+
+def test_lora_sleep_drops_gradients_and_pauses_tms_owned_base(actor_module, monkeypatch):
+    worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=False)
+    monkeypatch.setattr(actor_module, "is_lora_enabled", lambda _args: True)
+
+    worker.sleep()
+
+    assert [call.kwargs["tag"] for call in saver.pause.call_args_list] == [
+        "grad_buffer",
+        "default",
+    ]
+
+
+def test_lora_wake_uses_tms_only_and_has_no_tensor_backuper(actor_module, monkeypatch):
+    worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=True)
+    monkeypatch.setattr(actor_module, "is_lora_enabled", lambda _args: True)
+    worker.weights_backuper = None
+
+    worker.wake_up()
+
+    assert [call.kwargs["tag"] for call in saver.resume.call_args_list] == [
+        "default",
+        "grad_buffer",
+    ]
     assert worker._asleep is False
 
 

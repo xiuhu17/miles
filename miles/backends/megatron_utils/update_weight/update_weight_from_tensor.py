@@ -12,19 +12,21 @@ import torch.distributed as dist
 from ray import ObjectRef
 from ray.actor import ActorHandle
 
-from miles.backends.megatron_utils.lora_utils import (
-    build_lora_sync_config,
-    is_lora_weight_name,
-    lora_base_cpu_backup_enabled,
-)
+from miles.backends.megatron_utils.lora_utils import build_lora_sync_config, is_lora_weight_name
+from miles.backends.megatron_utils.lora_utils import rollout_owns_lora_base as _rollout_owns_lora_base
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.lora import LORA_ADAPTER_NAME
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
-from .common import _check_weight_sync_results, begin_weight_update, end_weight_update, weight_update_selector
+from .common import (
+    _check_weight_sync_results,
+    begin_weight_update,
+    end_weight_update,
+    weight_update_format,
+    weight_update_selector,
+)
 from .hf_weight_iterator_base import HfWeightIteratorBase
-
 from .update_weight_from_distributed.broadcast import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
@@ -112,7 +114,16 @@ class UpdateWeightFromTensor:
         if self.is_lora:
             self._lora_config = build_lora_sync_config(args)
             self._lora_loaded = False
-            self._lora_base_synced = False
+            if not _rollout_owns_lora_base(args):
+                raise ValueError(
+                    "LoRA frozen base is trainer-TMS-owned and is never republished. "
+                    "A colocated offloaded rollout must enable --lora-base-cpu-backup."
+                )
+            if getattr(args, "check_weight_update_equal", False):
+                logger.warning(
+                    "--check-weight-update-equal does not resend the frozen LoRA base; "
+                    "use --check-lora-weight-equal to validate adapter updates"
+                )
 
         self._mm_tower_cache: list[tuple[str, torch.Tensor]] | None = None
 
@@ -242,27 +253,22 @@ class UpdateWeightFromTensor:
 
         rank = dist.get_rank()
 
-        # TODO: implement lora weight checker
-        colocate_base_persistent = getattr(self.args, "colocate", False) and not getattr(
-            self.args, "offload_rollout", True
-        )
-        skip_base_sync = (
-            self.is_lora
-            and (self.use_distribute or lora_base_cpu_backup_enabled(self.args) or colocate_base_persistent)
-            and not getattr(self.args, "check_weight_update_equal", False)
-        )
+        skip_base_sync = self.is_lora
 
         if rank == 0:
             mode = self.args.pause_generation_mode
             ray.get([engine.pause_generation.remote(mode=mode) for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
             if not skip_base_sync:
-                begin_weight_update(self.rollout_engines, weight_update_selector(self.args))
+                begin_weight_update(
+                    self.rollout_engines,
+                    weight_update_selector(self.args),
+                    weight_update_format(self.args),
+                )
         dist.barrier(group=get_gloo_group())
 
-        megatron_local_weights = self.weights_getter()
-
         if not skip_base_sync:
+            megatron_local_weights = self.weights_getter()
             for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
                 megatron_local_weights, weight_type="base"
             ):
@@ -286,9 +292,7 @@ class UpdateWeightFromTensor:
             # one call; drain the bridge's chunker so --update-weight-buffer-size
             # only bounds the base path.
             accumulated_named_tensors: list = []
-            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
-                megatron_local_weights, weight_type="lora"
-            ):
+            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks({}, weight_type="lora"):
                 accumulated_named_tensors.extend(hf_named_tensors)
 
             if not accumulated_named_tensors:
@@ -307,9 +311,6 @@ class UpdateWeightFromTensor:
             del accumulated_named_tensors
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
-
-            if not self._lora_base_synced:
-                self._lora_base_synced = True
 
         dist.barrier(group=get_gloo_group())
 

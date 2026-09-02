@@ -171,7 +171,6 @@ async def create_training_models(args, pgs, rollout_manager):
         critic_args = copy.deepcopy(args)
         critic_args.kl_coef = 0
         critic_args.use_opd = False
-        critic_args.disable_param_buffers_cpu_backup = False
         critic_model = allocate_train_group(
             args=critic_args,
             num_nodes=args.critic_num_nodes,

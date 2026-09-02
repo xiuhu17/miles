@@ -700,9 +700,12 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response
 
-    def begin_weight_update(self, selector: str = "all"):
+    def begin_weight_update(self, selector: str = "all", weight_format: str = "default"):
         """Open a weight-update session on the engine (restores packed weights for loading)."""
-        return self._make_request("begin_weight_update", {"selector": selector})
+        return self._make_request(
+            "begin_weight_update",
+            {"selector": selector, "weight_format": weight_format},
+        )
 
     def end_weight_update(self):
         """Close the weight-update session (post-load + quant post-process on the full model)."""

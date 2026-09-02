@@ -54,6 +54,14 @@ def export_hf_model_direct(
     """
     path = Path(path)
     is_writer = torch.distributed.get_rank() == 0
+    if getattr(args, "fp8_param_gather", False):
+        if is_writer:
+            (path / HF_EXPORT_COMPLETE_MARKER).unlink(missing_ok=True)
+        raise RuntimeError(
+            "HF export of native MXFP8 primary weights is not implemented: the export must "
+            "write both data/scale tensors and an MXFP8 quantization config"
+        )
+
     if is_writer:
         path.mkdir(parents=True, exist_ok=True)
         # A stale marker from an earlier run would vouch for this run's half-written shards.

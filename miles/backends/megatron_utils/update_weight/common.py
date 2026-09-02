@@ -13,7 +13,7 @@ from ray.actor import ActorHandle
 
 from miles.backends.megatron_utils.misc_utils import strip_param_name_prefix
 from miles.backends.training_utils.parallel import get_parallel_state
-from miles.utils.types import ParamInfo
+from miles.utils.lora import is_lora_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -221,71 +221,6 @@ def all_gather_param(args: Namespace, name: str, param: torch.nn.Parameter) -> t
     return param
 
 
-def all_gather_params_async(
-    args: Namespace,
-    param_infos_and_params: list[tuple[ParamInfo, torch.Tensor]],
-) -> list[torch.Tensor]:
-    """
-    Parallel TP all-gather for multiple params. Loop 1: for each TP param, allocate buffers +
-    dist.all_gather(async_op=True) on expert-TP/regular-TP group (skip expert_bias/non-TP/duplicated).
-    Loop 2: wait all NCCL handles (enables overlap). Loop 3: concat partitions + apply GLU rechunk/MoE dim fix.
-    """
-    # Phase 1: Start all async all_gather operations
-    gather_tasks = []
-    handles = []
-
-    for info, param in param_infos_and_params:
-        # Prepare async all_gather
-        if "expert_bias" in info.name:
-            gather_tasks.append((info, param, None, None, None, None))
-            handles.append(None)
-        elif getattr(param, "parallel_mode", None) == "duplicated" or (
-            not param.tensor_model_parallel and not _is_unmarked_grouped_expert_weight(info.name, param)
-        ):
-            gather_tasks.append((info, param.data, None, None, None, None))
-            handles.append(None)
-        else:
-            # Start async all_gather
-            if is_routed_expert_param(info.name):
-                tp_size = get_parallel_state().etp.size
-                tp_group = get_parallel_state().etp.group
-            else:
-                tp_size = get_parallel_state().tp.size
-                tp_group = get_parallel_state().tp.group
-
-            if tp_size <= 1:
-                gather_tasks.append((info, param.data, None, None, None, None))
-                handles.append(None)
-                continue
-
-            param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
-            handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
-            gather_tasks.append((info, None, handle, param_partitions, param.partition_dim, param.partition_stride))
-            handles.append(handle)
-
-    # Phase 2: Wait for ALL async operations to complete at once
-    # This ensures maximum parallelism by not blocking on individual operations
-    for handle in handles:
-        if handle is not None:
-            handle.wait()
-
-    # Phase 3: Process all results after all communications are done
-    gathered_params = []
-    for info, direct_param, handle, param_partitions, partition_dim, partition_stride in gather_tasks:
-        if handle is None:
-            # No all_gather needed
-            param = direct_param
-        else:
-            partition_stride, partition_dim = _check_and_fix_partition(
-                args, info.name, partition_stride, partition_dim
-            )
-            param = _gather_with_stride(param_partitions, partition_dim, partition_stride)
-
-        gathered_params.append(param)
-
-    return gathered_params
-
-
 def named_params_and_buffers(
     args: Namespace,
     model: Sequence[torch.nn.Module],
@@ -411,9 +346,28 @@ def collect_named_tensors_for_weight_transfer(
             yield name, tensor
 
 
-def begin_weight_update(rollout_engines: Sequence[ActorHandle], selector: str = "all"):
+def begin_weight_update(
+    rollout_engines: Sequence[ActorHandle],
+    selector: str = "all",
+    weight_format: str = "default",
+):
     """Open a weight-update session on the selected rollout engines (restore packed weights)."""
-    ray.get([engine.begin_weight_update.remote(selector=selector) for engine in rollout_engines])
+    ray.get(
+        [
+            engine.begin_weight_update.remote(
+                selector=selector,
+                weight_format=weight_format,
+            )
+            for engine in rollout_engines
+        ]
+    )
+
+
+def weight_update_format(args) -> str:
+    """Describe the base-weight representation sent in this update session."""
+    if getattr(args, "fp8_param_gather", False) and not is_lora_enabled(args):
+        return "native_mxfp8"
+    return "default"
 
 
 def weight_update_selector(args) -> str:

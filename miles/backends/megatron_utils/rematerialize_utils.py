@@ -34,7 +34,9 @@ def build_main_cast_context(args: Namespace, *, model: Sequence[torch.nn.Module]
     )
     return MainCastContext(
         cast_main_to_params=_build_cast_main_to_params_fn(
-            optimizer, precision_aware=args.use_precision_aware_optimizer
+            optimizer,
+            precision_aware=args.use_precision_aware_optimizer,
+            reuse_grad_buf_for_mxfp8_param_ag=args.reuse_grad_buf_for_mxfp8_param_ag,
         ),
         model_chunks=model,
         extras_getter=lambda: _named_restore_extras(model),
@@ -43,13 +45,30 @@ def build_main_cast_context(args: Namespace, *, model: Sequence[torch.nn.Module]
     )
 
 
-def _build_cast_main_to_params_fn(optimizer, *, precision_aware: bool) -> Callable[[], None]:
+def _build_cast_main_to_params_fn(
+    optimizer,
+    *,
+    precision_aware: bool,
+    reuse_grad_buf_for_mxfp8_param_ag: bool = False,
+) -> Callable[[], None]:
     dist_opts = optimizer.chained_optimizers
     if not precision_aware:
 
         def cast_mcore():
             for dist_opt in dist_opts:
-                dist_opt._copy_main_params_to_model_params()
+                # Match MegatronOptimizer.step_with_ready_grads exactly. With
+                # MXFP8 grad/param-buffer reuse, native parameter storage is not
+                # the all-gather source: the local FP32 master shard must first
+                # be staged into the shared BF16 buffer. The following DDP
+                # start_param_sync then gathers and requantizes the committed
+                # native MXFP8 parameter.
+                #
+                # LayerWise non-DistOpt children have no byte-shard staging
+                # buffer and intentionally retain Megatron's direct-copy path.
+                if reuse_grad_buf_for_mxfp8_param_ag and not getattr(dist_opt, "_layer_wise_non_distopt_child", False):
+                    dist_opt._copy_main_params_to_param_buffer()
+                else:
+                    dist_opt._copy_main_params_to_model_params()
 
         return cast_mcore
 
