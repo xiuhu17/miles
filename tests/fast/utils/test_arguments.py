@@ -12,6 +12,7 @@ from miles.utils.arguments import (
     _maybe_apply_dumper_overrides,
     _resolve_ft_components,
     _resolve_rollout_functions,
+    _validate_lora_mxfp8_base,
     _validate_rematerialize_param_from_master_weight,
     get_miles_extra_args_provider,
     miles_validate_args,
@@ -987,6 +988,91 @@ class TestValidateRematerializeParamFromMasterWeight:
         )
         with pytest.raises(AssertionError, match="Megatron"):
             _validate_rematerialize_param_from_master_weight(args)
+
+
+class TestValidateLoraMxfp8Base:
+    def _make_args(self, **overrides) -> SimpleNamespace:
+        args = SimpleNamespace(
+            fp8_param_gather=True,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            lora_rank=8,
+            lora_adapter_path=None,
+            multi_lora=False,
+            train_backend="megatron",
+            megatron_to_hf_mode="bridge",
+            transformer_impl="transformer_engine",
+            offload_train=True,
+            offload_train_target="cpu",
+            lora_train_only=False,
+            sglang_quantization="mxfp8",
+            colocate=True,
+            offload_rollout=True,
+            lora_base_cpu_backup=True,
+            optimizer_cpu_offload=True,
+            use_precision_aware_optimizer=True,
+            check_weight_update_equal=False,
+            check_lora_weight_equal=False,
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_accepts_cpu_optimizer_for_frozen_base(self):
+        args = self._make_args()
+
+        _validate_lora_mxfp8_base(args)
+
+        assert args.optimizer_cpu_offload is True
+
+    def test_accepts_existing_gpu_optimizer_path(self):
+        args = self._make_args(optimizer_cpu_offload=False, use_precision_aware_optimizer=False)
+
+        _validate_lora_mxfp8_base(args)
+
+        assert args.optimizer_cpu_offload is False
+
+    def test_replaces_full_weight_checker_with_adapter_checker(self):
+        args = self._make_args(check_weight_update_equal=True)
+
+        _validate_lora_mxfp8_base(args)
+
+        assert args.check_weight_update_equal is False
+        assert args.check_lora_weight_equal is True
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"multi_lora": True},
+            {"keep_old_actor": True},
+            {"use_kl_loss": True},
+            {"opd_teacher_load": "/teacher"},
+            {"train_backend": "fsdp"},
+            {"megatron_to_hf_mode": "raw"},
+            {"transformer_impl": "local"},
+            {"fp8": None},
+            {"fp8_recipe": "delayed"},
+            {"fp4_param_gather": True},
+            {"colocate": False},
+            {"offload_train": False},
+            {"offload_rollout": False},
+            {"offload_train_target": "disk"},
+            {"colocate_memory_peak_device": "gpu"},
+            {"stream_optimizer_state_to_disk": True},
+            {"rematerialize_param_from_master_weight": True},
+            {"lora_train_only": True},
+            {"sglang_quantization": None},
+            {"lora_base_cpu_backup": False},
+            {"use_precision_aware_optimizer": False},
+        ],
+    )
+    def test_rejects_out_of_scope_modes(self, overrides):
+        with pytest.raises(ValueError):
+            _validate_lora_mxfp8_base(self._make_args(**overrides))
+
+    def test_rejects_full_ft_fp8_param_gather(self):
+        with pytest.raises(ValueError, match="only a frozen LoRA base"):
+            _validate_lora_mxfp8_base(self._make_args(lora_rank=0))
 
 
 @pytest.mark.parametrize(

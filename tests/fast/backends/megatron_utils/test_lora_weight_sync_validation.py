@@ -242,6 +242,63 @@ class TestUpdateWeightsZeroChunks:
         updater.update_weights()
 
 
+class TestLoraBaseCpuBackupUpdate:
+    @patch(f"{_UW_MODULE}._pp_assemble_full_adapter", side_effect=lambda tensors: tensors)
+    @patch(f"{_UW_MODULE}.torch.cuda.empty_cache")
+    @patch(f"{_UW_MODULE}.torch.cuda.ipc_collect")
+    @patch(f"{_UW_MODULE}.get_gloo_group", return_value=MagicMock())
+    @patch(f"{_UW_MODULE}.ray")
+    @patch(f"{_UW_MODULE}.dist")
+    @patch(f"{_UW_MODULE}.HfWeightIteratorBase")
+    def test_existing_updater_never_requests_frozen_base(
+        self,
+        mock_iter_base,
+        mock_dist,
+        mock_ray,
+        _mock_gloo,
+        _mock_ipc_collect,
+        _mock_empty_cache,
+        _mock_assemble,
+    ):
+        mock_dist.get_world_size.return_value = 2
+        mock_dist.get_rank.return_value = 1
+        mock_dist.new_group.return_value = MagicMock()
+        mock_ray.get.return_value = []
+
+        requested_weight_types = []
+
+        def get_chunks(_weights, *, weight_type):
+            requested_weight_types.append(weight_type)
+            if weight_type == "base":
+                raise AssertionError("frozen base must not enter LoRA weight update")
+            yield SAMPLE_LORA_WEIGHTS
+
+        iterator = MagicMock()
+        iterator.get_hf_weight_chunks.side_effect = get_chunks
+        mock_iter_base.create.return_value = iterator
+        weights_getter = MagicMock(return_value={})
+        updater = UpdateWeightFromTensor(
+            args=_make_args(
+                colocate=True,
+                offload_rollout=True,
+                lora_base_cpu_backup=True,
+                check_weight_update_equal=False,
+            ),
+            model=[MagicMock()],
+            weights_getter=weights_getter,
+            model_name="glm",
+            quantization_config=None,
+            is_lora=True,
+        )
+        updater.use_distribute = False
+        updater._send_lora_params = MagicMock(return_value=([], []))
+
+        updater.update_weights()
+
+        weights_getter.assert_called_once_with()
+        assert requested_weight_types == ["lora"]
+
+
 # ---------------------------------------------------------------------------
 # FlattenedTensorBucket round-trip correctness
 # ---------------------------------------------------------------------------

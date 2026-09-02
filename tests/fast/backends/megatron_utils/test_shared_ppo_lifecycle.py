@@ -212,6 +212,7 @@ def _lifecycle_worker(actor_module, monkeypatch, asleep):
         offload_train=True,
         rematerialize_param_from_master_weight=False,
         clear_quantized_weight_workspaces_on_offload=False,
+        fp8_param_gather=False,
     )
     worker._asleep = asleep
     saver = Mock()
@@ -256,6 +257,33 @@ def test_wake_up_resumes_offloaded_model_once(actor_module, monkeypatch):
 
     assert saver.resume.call_count == 1
     assert worker._asleep is False
+
+
+def test_lora_mxfp8_sleep_drops_gradients_and_pauses_only_tms_base(actor_module, monkeypatch):
+    worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=False)
+    worker.args.fp8_param_gather = True
+    monkeypatch.setattr(actor_module, "is_lora_enabled", lambda _args: True)
+
+    worker.sleep()
+
+    assert [call.kwargs["tag"] for call in saver.pause.call_args_list] == ["grad_buffer", "default"]
+
+
+def test_lora_mxfp8_wake_restores_base_before_gradient_storage(actor_module, monkeypatch):
+    worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=True)
+    worker.args.fp8_param_gather = True
+    monkeypatch.setattr(actor_module, "is_lora_enabled", lambda _args: True)
+
+    worker.wake_up()
+
+    assert [call.kwargs["tag"] for call in saver.resume.call_args_list] == ["default", "grad_buffer"]
+
+
+def test_lora_mxfp8_never_enables_tensor_backuper(actor_module):
+    worker = object.__new__(actor_module.MegatronTrainRayActor)
+    worker.args = Namespace(lora_rank=8, lora_adapter_path=None, fp8_param_gather=True)
+
+    assert worker._enable_weight_backup is False
 
 
 def _actor_train_args(**overrides):

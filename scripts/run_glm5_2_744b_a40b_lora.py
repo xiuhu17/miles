@@ -41,6 +41,10 @@ adapters still sync per step, only the base-weight sync is skipped). The rollout
 Expected parity on the toy (gsm8k, 5 rollouts): train_rollout_logprob_abs_diff ~0.27 /
 train_rollout_kl ~0.058, flat across steps (constant weight-quantization offset), vs
 ~0.010 / ~1.2e-4 with the bf16 rollout.
+
+Native MXFP8 LoRA base on both trainer and rollout (only adapters sync per step):
+  python scripts/run_glm5_2_744b_a40b_lora.py train --model-name GLM-5.2_5layer \
+      --fp8-param-gather --num-gpus-per-node 4
 """
 
 import os
@@ -127,11 +131,19 @@ class ScriptArgs(U.ExecuteTrainConfig):
     fp8_rollout: bool = False
     # rollout-side fp8 checkpoint; defaults to <hf_checkpoint>_fp8 (e.g. GLM-5.2_fp8).
     fp8_rollout_checkpoint: str | None = None
+    # Keep the frozen trainer base in native MXFP8 primary storage. SGLang
+    # independently online-quantizes and owns its rollout-side base.
+    fp8_param_gather: bool = False
 
     enable_wandb: bool = True
     extra_args: str = ""
 
     def __post_init__(self):
+        if self.fp8_param_gather and self.fp8_rollout:
+            raise ValueError(
+                "--fp8-param-gather cannot be combined with the legacy pre-converted "
+                "--fp8-rollout checkpoint path"
+            )
         if self.hf_checkpoint is None:
             self.hf_checkpoint = f"{self.model_dir}/{self.model_name}"
         if self.fp8_rollout and self.fp8_rollout_checkpoint is None:
@@ -212,6 +224,13 @@ def _train(args: ScriptArgs):
     if args.lora_base_cpu_backup:
         lora_args += "--lora-base-cpu-backup "
 
+    trainer_precision_args = ""
+    if args.fp8_param_gather:
+        trainer_precision_args = (
+            "--transformer-impl transformer_engine --fp8-format e4m3 "
+            "--fp8-recipe mxfp8 --fp8-param-gather "
+        )
+
     rollout_args = (
         "--label-key label "
         "--apply-chat-template "
@@ -290,6 +309,8 @@ def _train(args: ScriptArgs):
                 f"        num_gpus: {args.num_gpus_per_node}\n"
             )
         sglang_args += f"--sglang-config {sglang_config_path} "
+    elif args.fp8_param_gather:
+        sglang_args += "--sglang-quantization mxfp8 "
 
     save_args = f"--save-interval 1 --save {load_save_path} "
 
@@ -301,7 +322,7 @@ def _train(args: ScriptArgs):
         f"--seq-length {args.seq_window} --rollout-max-context-len {args.seq_window} " if args.seq_window > 0 else ""
     )
 
-    train_args = f"{ckpt_args} {lora_args} {rollout_args} {seq_args} {optimizer_args} {grpo_args} {r3_args} {wandb_args} {perf_args} {sglang_args} {save_args} {misc_args} {args.extra_args} "
+    train_args = f"{ckpt_args} {lora_args} {rollout_args} {seq_args} {optimizer_args} {grpo_args} {r3_args} {wandb_args} {perf_args} {trainer_precision_args} {sglang_args} {save_args} {misc_args} {args.extra_args} "
 
     U.execute_train(
         train_args=train_args,

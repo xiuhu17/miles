@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from argparse import Namespace
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 from megatron.core.utils import get_attr_wrapped_model
@@ -67,6 +68,87 @@ def _make_value_model_hook(hidden_size: int):
 
 def _get_model_config_from_wrapped(model):
     return get_attr_wrapped_model(model, "config", allow_none=False)
+
+
+def _configure_lora_mxfp8_provider(provider, args: Namespace) -> None:
+    """Enable native MXFP8 primary storage on a Bridge-built LoRA base."""
+    if not getattr(args, "fp8_param_gather", False):
+        return
+    if not hasattr(provider, "fp8_param"):
+        raise RuntimeError(
+            "The installed Megatron-Bridge provider does not expose fp8_param; "
+            "it cannot honor --fp8-param-gather safely."
+        )
+
+    provider.fp8 = args.fp8
+    provider.fp8_recipe = args.fp8_recipe
+    provider.fp8_param = True
+
+
+def _lora_adapter_allocation_region(args: Namespace):
+    """Keep the small trainable adapter outside the TMS-backed base region."""
+    if not (getattr(args, "fp8_param_gather", False) and getattr(args, "offload_train", False)):
+        return nullcontext()
+
+    from torch_memory_saver import torch_memory_saver
+
+    return torch_memory_saver.region(tag="lora_adapter", enable_cpu_backup=False)
+
+
+def _clear_frozen_high_precision_init_values(model_chunks) -> tuple[int, int]:
+    """Drop TE's temporary BF16 copies for frozen quantized base weights."""
+    native_params = 0
+    cleared_params = 0
+    cleared_bytes = 0
+    seen_params: set[int] = set()
+    for model_chunk in _ensure_model_list(model_chunks):
+        for param in model_chunk.parameters():
+            if id(param) in seen_params:
+                continue
+            seen_params.add(id(param))
+
+            get_init_value = getattr(param, "get_high_precision_init_val", None)
+            clear_init_value = getattr(param, "clear_high_precision_init_val", None)
+            if not callable(get_init_value) or not callable(clear_init_value):
+                continue
+            native_params += 1
+            if param.requires_grad:
+                raise RuntimeError(
+                    "LoRA MXFP8 frozen-base mode found a trainable native quantized parameter; "
+                    "only BF16/FP32 adapter parameters may enter the optimizer"
+                )
+            init_value = get_init_value()
+            if init_value is None:
+                continue
+            cleared_params += 1
+            cleared_bytes += init_value.numel() * init_value.element_size()
+            clear_init_value()
+            if get_init_value() is not None:
+                raise RuntimeError("TransformerEngine did not release a frozen base high-precision init copy")
+
+    if not native_params:
+        raise RuntimeError("LoRA MXFP8 mode did not construct any native quantized frozen base parameters")
+
+    if cleared_params:
+        logger.info(
+            "Cleared TE high-precision init copies for %d frozen LoRA parameters (%.2f GiB)",
+            cleared_params,
+            cleared_bytes / 1024**3,
+        )
+    return cleared_params, cleared_bytes
+
+
+def _freeze_lora_base_expert_bias(model_chunks) -> int:
+    """Prevent trainer-only router-bias updates when rollout owns its base."""
+    frozen = 0
+    for model_chunk in _ensure_model_list(model_chunks):
+        for module in model_chunk.modules():
+            if hasattr(module, "frozen_expert_bias") and getattr(module, "expert_bias", None) is not None:
+                module.frozen_expert_bias = True
+                frozen += 1
+    if frozen:
+        logger.info("Froze %d LoRA-base router expert_bias buffers", frozen)
+    return frozen
 
 
 def _validate_multi_lora_moe_support(args: Namespace, provider) -> None:
@@ -148,6 +230,7 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
     provider.variable_seq_lengths = True
     provider.moe_token_dispatcher_type = "alltoall"
     provider.moe_router_load_balancing_type = "none"
+    _configure_lora_mxfp8_provider(provider, args)
     if is_multi_lora_enabled(args) and targets_expert_leaves(args.target_modules):
         # Expert adapters cannot replay the fused permute's row_id_map, and most bridge
         # MoE providers default the fusion on — so turn it off rather than refuse to build.
@@ -177,7 +260,8 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
         lora = create_lora_instance(args)
 
     def apply_lora_hook(model_chunks):
-        transformed = lora(model_chunks, training=True)
+        with _lora_adapter_allocation_region(args):
+            transformed = lora(model_chunks, training=True)
         lora.set_params_to_save(transformed)
         return transformed
 
@@ -206,4 +290,7 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
         patch_param_grad_buffer_for_colocate_mode_lora()
 
     model = provider.provide_distributed_model(wrap_with_ddp=True, ddp_config=ddp_config)
+    if getattr(args, "fp8_param_gather", False):
+        _freeze_lora_base_expert_bias(model)
+        _clear_frozen_high_precision_init_values(model)
     return model

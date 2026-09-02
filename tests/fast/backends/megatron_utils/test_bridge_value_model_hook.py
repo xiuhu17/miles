@@ -180,3 +180,102 @@ def test_value_head_kwargs_match_the_real_constructor(hook_env):
     head = chunk.output_layer
 
     inspect.Signature(parameters).bind(input_size=head.input_size, output_size=head.output_size, config=head.config)
+
+
+def test_lora_mxfp8_config_reaches_bridge_provider(helpers_module):
+    provider = types.SimpleNamespace(fp8=None, fp8_recipe=None, fp8_param=False)
+    args = types.SimpleNamespace(fp8_param_gather=True, fp8="e4m3", fp8_recipe="mxfp8")
+
+    helpers_module.helpers._configure_lora_mxfp8_provider(provider, args)
+
+    assert provider.fp8 == "e4m3"
+    assert provider.fp8_recipe == "mxfp8"
+    assert provider.fp8_param is True
+
+
+def test_lora_mxfp8_rejects_bridge_without_native_primary_support(helpers_module):
+    provider = types.SimpleNamespace(fp8=None, fp8_recipe=None)
+    args = types.SimpleNamespace(fp8_param_gather=True, fp8="e4m3", fp8_recipe="mxfp8")
+
+    with pytest.raises(RuntimeError, match="does not expose fp8_param"):
+        helpers_module.helpers._configure_lora_mxfp8_provider(provider, args)
+
+
+def test_lora_adapter_uses_no_backup_tms_region(helpers_module, monkeypatch):
+    marker = object()
+    calls = []
+    saver = types.SimpleNamespace(region=lambda **kwargs: calls.append(kwargs) or marker)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_memory_saver",
+        types.SimpleNamespace(torch_memory_saver=saver),
+    )
+    args = types.SimpleNamespace(fp8_param_gather=True, offload_train=True)
+
+    assert helpers_module.helpers._lora_adapter_allocation_region(args) is marker
+    assert calls == [{"tag": "lora_adapter", "enable_cpu_backup": False}]
+
+
+class _FakeQuantizedParam:
+    def __init__(self, *, requires_grad: bool, init_value) -> None:
+        self.requires_grad = requires_grad
+        self._init_value = init_value
+        self.clear_calls = 0
+
+    def get_high_precision_init_val(self):
+        return self._init_value
+
+    def clear_high_precision_init_val(self):
+        self._init_value = None
+        self.clear_calls += 1
+
+
+class _FakeParamModel:
+    def __init__(self, params, modules=()) -> None:
+        self._params = params
+        self._modules = modules
+
+    def parameters(self):
+        return iter(self._params)
+
+    def modules(self):
+        return iter(self._modules)
+
+
+def test_frozen_te_init_copy_is_cleared_once(helpers_module):
+    frozen = _FakeQuantizedParam(
+        requires_grad=False,
+        init_value=types.SimpleNamespace(numel=lambda: 8, element_size=lambda: 2),
+    )
+    trainable = types.SimpleNamespace(requires_grad=True)
+    model = _FakeParamModel([frozen, frozen, trainable])
+
+    count, num_bytes = helpers_module.helpers._clear_frozen_high_precision_init_values([model])
+
+    assert (count, num_bytes) == (1, 16)
+    assert frozen.clear_calls == 1
+
+
+def test_trainable_native_quantized_parameter_is_rejected(helpers_module):
+    trainable = _FakeQuantizedParam(
+        requires_grad=True,
+        init_value=types.SimpleNamespace(numel=lambda: 4, element_size=lambda: 2),
+    )
+
+    with pytest.raises(RuntimeError, match="only BF16/FP32 adapter parameters"):
+        helpers_module.helpers._clear_frozen_high_precision_init_values([_FakeParamModel([trainable])])
+
+
+def test_missing_native_quantized_base_is_rejected(helpers_module):
+    model = _FakeParamModel([types.SimpleNamespace(requires_grad=False)])
+
+    with pytest.raises(RuntimeError, match="did not construct any native quantized"):
+        helpers_module.helpers._clear_frozen_high_precision_init_values([model])
+
+
+def test_lora_base_router_bias_is_frozen(helpers_module):
+    router = types.SimpleNamespace(frozen_expert_bias=False, expert_bias=object())
+    model = _FakeParamModel([], [router])
+
+    assert helpers_module.helpers._freeze_lora_base_expert_bias([model]) == 1
+    assert router.frozen_expert_bias is True

@@ -217,20 +217,30 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.sleep()
             return start_rollout_id
 
+        if getattr(args, "fp8_param_gather", False) and (with_ref or with_opd_teacher or args.keep_old_actor):
+            raise NotImplementedError(
+                "LoRA MXFP8 base offload does not support Megatron-side ref/teacher/old-actor "
+                "model switching because the frozen base is backed only by TMS."
+            )
+
         main_cast_ctx = None
         if args.rematerialize_param_from_master_weight:
             main_cast_ctx = build_main_cast_context(args, model=self.model, optimizer=self.optimizer)
 
-        self.weights_backuper = TensorBackuper.create(
-            source_getter=lambda: named_params_and_buffers(
-                self.args,
-                self.model,
-                convert_to_global_name=args.megatron_to_hf_mode == "raw",
-            ),
-            main_cast_ctx=main_cast_ctx,
-        )
+        native_lora_base = is_lora_enabled(args) and getattr(args, "fp8_param_gather", False)
+        self.weights_backuper = None
+        if not native_lora_base:
+            self.weights_backuper = TensorBackuper.create(
+                source_getter=lambda: named_params_and_buffers(
+                    self.args,
+                    self.model,
+                    convert_to_global_name=args.megatron_to_hf_mode == "raw",
+                ),
+                main_cast_ctx=main_cast_ctx,
+            )
         self._active_model_tag: str | None = "actor"
         if self._enable_weight_backup:
+            assert self.weights_backuper is not None
             self.weights_backuper.backup("actor")
 
         if with_ref:
@@ -245,6 +255,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.load_other_checkpoint("old_actor", args.load)
             # Create rollout_actor as a copy of current actor
             if args.update_weights_interval == 1:
+                assert self.weights_backuper is not None
                 self.weights_backuper.backup("rollout_actor")
 
         if self.args.vocab_size is None:
@@ -269,7 +280,9 @@ class MegatronTrainRayActor(TrainRayActor):
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,
-            weights_getter=lambda: self.weights_backuper.get("actor"),
+            # Bridge exports live adapter parameters directly. The empty mapping
+            # makes the frozen TMS-owned base unavailable to weight update.
+            weights_getter=lambda: {} if self.weights_backuper is None else self.weights_backuper.get("actor"),
             model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
             quantization_config=getattr(self.hf_config, "quantization_config", None),
             is_lora=lora_rollout_enabled(args),
@@ -328,8 +341,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         destroy_process_groups()
 
-        if self.args.rematerialize_param_from_master_weight and self.role == "actor":
-            # Params stay resident for update_weights, which pauses them afterwards.
+        if (self.args.rematerialize_param_from_master_weight and self.role == "actor") or (
+            is_lora_enabled(self.args) and getattr(self.args, "fp8_param_gather", False)
+        ):
+            # Gradients are disposable. The parameter storage needed by the
+            # following publish stays active; LoRA's frozen base is in default.
             torch_memory_saver.pause(tag="grad_buffer")
             torch_memory_saver.pause(tag="default")
         else:
@@ -352,8 +368,12 @@ class MegatronTrainRayActor(TrainRayActor):
             return
         print_memory("before wake_up model")
 
-        tag = "default" if lora_rollout_enabled(self.args) else None
-        torch_memory_saver.resume(tag=tag)
+        if is_lora_enabled(self.args) and getattr(self.args, "fp8_param_gather", False):
+            torch_memory_saver.resume(tag="default")
+            torch_memory_saver.resume(tag="grad_buffer")
+        else:
+            tag = "default" if lora_rollout_enabled(self.args) else None
+            torch_memory_saver.resume(tag=tag)
 
         clear_memory()
         reload_process_groups()
@@ -363,6 +383,8 @@ class MegatronTrainRayActor(TrainRayActor):
     @property
     def _enable_weight_backup(self) -> bool:
         """Weight backup is only needed for CPU-side model switching or colocated tensor weight sync."""
+        if is_lora_enabled(self.args) and getattr(self.args, "fp8_param_gather", False):
+            return False
         return self.with_ref or self.with_opd_teacher or self.args.keep_old_actor or self.args.colocate
 
     def _switch_model(self, target_tag: str) -> None:
@@ -517,7 +539,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:
-                if "ref" in self.weights_backuper.backup_tags:
+                if self.weights_backuper is not None and "ref" in self.weights_backuper.backup_tags:
                     self._set_replay_stage("fallthrough")
                     self._switch_model("ref")
                     rollout_data.update(
@@ -529,7 +551,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     )
                 # Forward teacher model to get teacher_log_probs for Megatron-based OPD
-                if "teacher" in self.weights_backuper.backup_tags:
+                if self.weights_backuper is not None and "teacher" in self.weights_backuper.backup_tags:
                     self._set_replay_stage("fallthrough")
                     self._switch_model("teacher")
                     rollout_data.update(
@@ -622,6 +644,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if (
                 self.args.ref_update_interval is not None
                 and (rollout_id + 1) % self.args.ref_update_interval == 0
+                and self.weights_backuper is not None
                 and "ref" in self.weights_backuper.backup_tags
             ):
                 with timer("ref_model_update"):
@@ -672,12 +695,14 @@ class MegatronTrainRayActor(TrainRayActor):
             key=lambda adapter: adapter.name,
         )
         if adapters_to_load:
+            assert self.weights_backuper is not None
             _load_adapters(self.args, self.model, self.optimizer, adapters_to_load)
             for adapter in adapters_to_load:
                 self.loaded_adapters[adapter.name] = adapter
                 self._multi_lora_pending_push.add(adapter.name)
             self.weights_backuper.backup("actor")
         if adapters_to_clean_up:
+            assert self.weights_backuper is not None
             _cleanup_adapters(self.args, self.model, self.optimizer, adapters_to_clean_up)
             for adapter in adapters_to_clean_up:
                 self.loaded_adapters.pop(adapter.name, None)
@@ -816,6 +841,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
 
             if getattr(self.args, "keep_old_actor", False):
+                assert self.weights_backuper is not None
                 if self.args.update_weights_interval == 1:
                     logger.info("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
                     # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
@@ -833,6 +859,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
+        assert self.weights_backuper is not None
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
         self.args.load = path
         self.args.no_load_optim = True

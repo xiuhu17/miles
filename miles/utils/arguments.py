@@ -2744,7 +2744,18 @@ def parse_args(add_custom_arguments=None):
     miles_validate_args(args)
 
     if backend == "megatron":
-        megatron_validate_args(args)
+        # Upstream's CPU-optimizer check assumes every FP8 primary may be
+        # trainable. This capability has only frozen MXFP8 base parameters and
+        # BF16 adapters; Miles validates that narrower contract below. Hide the
+        # CPU placement only while running that one conservative upstream gate.
+        frozen_base_cpu_optimizer = bool(args.fp8_param_gather and args.optimizer_cpu_offload)
+        if frozen_base_cpu_optimizer:
+            args.optimizer_cpu_offload = False
+        try:
+            megatron_validate_args(args)
+        finally:
+            if frozen_base_cpu_optimizer:
+                args.optimizer_cpu_offload = True
 
         # always use varlen
         args.variable_seq_lengths = True
@@ -2879,6 +2890,64 @@ def _validate_rematerialize_param_from_master_weight(args):
     args.disable_param_buffers_cpu_backup = True
     if args.ci_test:
         args.check_rematerialize_param_from_master_weight = True
+
+
+def _validate_lora_mxfp8_base(args) -> None:
+    """Validate the narrow LoRA frozen-base MXFP8/TMS capability."""
+    if not getattr(args, "fp8_param_gather", False):
+        return
+    if not is_lora_enabled(args):
+        raise ValueError("MILES --fp8-param-gather currently supports only a frozen LoRA base")
+    if getattr(args, "multi_lora", False):
+        raise ValueError("LoRA MXFP8 base storage does not support multi-LoRA yet")
+    if (
+        getattr(args, "keep_old_actor", False)
+        or getattr(args, "kl_coef", 0) != 0
+        or getattr(args, "use_kl_loss", False)
+        or getattr(args, "opd_teacher_load", None) is not None
+    ):
+        raise ValueError("LoRA MXFP8 base storage does not support Megatron-side ref/teacher/old-actor snapshots")
+    if args.train_backend != "megatron" or args.megatron_to_hf_mode != "bridge":
+        raise ValueError("LoRA MXFP8 base storage currently requires Megatron-Bridge mode")
+    if getattr(args, "transformer_impl", None) != "transformer_engine":
+        raise ValueError("LoRA MXFP8 base storage requires --transformer-impl transformer_engine")
+    if not getattr(args, "fp8", None):
+        raise ValueError("LoRA MXFP8 base storage requires --fp8-format")
+    if getattr(args, "fp8_recipe", None) != "mxfp8":
+        raise ValueError("LoRA --fp8-param-gather currently supports --fp8-recipe mxfp8 only")
+    if getattr(args, "fp4_param_gather", False) or getattr(args, "fp4", None):
+        raise ValueError("NVFP4/FP4 is outside the LoRA MXFP8 base scope")
+    if not (args.colocate and args.offload_train and args.offload_rollout):
+        raise ValueError("LoRA MXFP8 base storage requires colocated trainer and rollout CPU offload")
+    if args.offload_train_target != "cpu":
+        raise ValueError("LoRA MXFP8 base offload requires TMS's CPU backend")
+    if getattr(args, "colocate_memory_peak_device", "cpu") != "cpu":
+        raise ValueError("LoRA MXFP8 base storage currently supports --colocate-memory-peak-device cpu only")
+    if getattr(args, "stream_optimizer_state_to_disk", False):
+        raise ValueError("LoRA MXFP8 base storage does not support NVMe optimizer streaming")
+    if getattr(args, "rematerialize_param_from_master_weight", False):
+        raise ValueError("a frozen LoRA base has no FP32 master from which to rematerialize")
+    if getattr(args, "lora_train_only", False):
+        raise ValueError("LoRA MXFP8 base storage V1 requires an independently initialized rollout base")
+    if getattr(args, "sglang_quantization", None) != "mxfp8":
+        raise ValueError("LoRA MXFP8 base storage requires --sglang-quantization mxfp8 for rollout")
+    if not getattr(args, "lora_base_cpu_backup", False):
+        raise ValueError(
+            "offloaded colocated LoRA rollout must enable --lora-base-cpu-backup; "
+            "the trainer publishes adapters only"
+        )
+    if getattr(args, "optimizer_cpu_offload", False) and not getattr(
+        args, "use_precision_aware_optimizer", False
+    ):
+        raise ValueError("LoRA adapter CPU optimizer requires --use-precision-aware-optimizer")
+
+    if args.check_weight_update_equal:
+        logger.warning(
+            "LoRA MXFP8 base is not republished; replacing --check-weight-update-equal "
+            "with --check-lora-weight-equal"
+        )
+        args.check_weight_update_equal = False
+        args.check_lora_weight_equal = True
 
 
 def miles_validate_args(args):
@@ -3385,6 +3454,7 @@ def miles_validate_args(args):
         args.disable_grad_buffers_cpu_backup = True
         args.disable_param_buffers_cpu_backup = True
 
+    _validate_lora_mxfp8_base(args)
     _validate_rematerialize_param_from_master_weight(args)
 
     if (args.offload_train_target == "disk" or args.stream_optimizer_state_to_disk) and (
