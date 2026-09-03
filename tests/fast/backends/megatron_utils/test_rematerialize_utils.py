@@ -5,6 +5,7 @@ import torch
 
 from miles.backends.megatron_utils.rematerialize_utils import (
     _build_cast_main_to_params_fn,
+    _named_restore_extras,
     _replay_hybrid_device_copy_back,
 )
 
@@ -56,3 +57,41 @@ def test_builder_rejects_non_hdo_inner_under_precision_aware():
     optimizer = SimpleNamespace(chained_optimizers=[SimpleNamespace(optimizer=object())])
     with pytest.raises(AssertionError):
         _build_cast_main_to_params_fn(optimizer, precision_aware=True)
+
+
+def test_lora_rematerialize_only_pins_frozen_base_not_bf16_adapter():
+    model = torch.nn.Module()
+    model.register_parameter(
+        "frozen_base",
+        torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16), requires_grad=False),
+    )
+    model.register_parameter(
+        "adapter",
+        torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16), requires_grad=True),
+    )
+
+    extras = dict(_named_restore_extras([model]))
+
+    assert "vp_stages.0.frozen_base" in extras
+    assert "vp_stages.0.adapter" not in extras
+
+
+def test_adapter_only_rematerialize_leaves_frozen_base_to_tms():
+    model = torch.nn.Module()
+    model.register_parameter(
+        "frozen_base",
+        torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16), requires_grad=False),
+    )
+    model.register_parameter(
+        "lora_adapter",
+        torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16), requires_grad=True),
+    )
+
+    extras = dict(
+        _named_restore_extras(
+            [model],
+            parameter_filter=lambda name, _tensor: "lora_adapter" in name,
+        )
+    )
+
+    assert extras == {}

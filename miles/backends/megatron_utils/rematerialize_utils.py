@@ -12,20 +12,33 @@ from miles.utils.tensor_backper import MainCastContext
 
 logger = logging.getLogger(__name__)
 
+_ParameterFilter = Callable[[str, torch.Tensor], bool]
 
-def _named_restore_extras(model: Sequence[torch.nn.Module]) -> Iterator[tuple[str, torch.Tensor]]:
+
+def _named_restore_extras(
+    model: Sequence[torch.nn.Module],
+    parameter_filter: _ParameterFilter | None = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
     """Tensors with no master weight to rebuild from, so they keep a pinned backup."""
     for vp_stage, model_module in enumerate(model):
         for name, buffer in model_module.named_buffers():
-            if "expert_bias" in name:
+            if "expert_bias" in name and (parameter_filter is None or parameter_filter(name, buffer)):
                 yield f"vp_stages.{vp_stage}.{strip_param_name_prefix(name)}", buffer
         for name, param in model_module.named_parameters():
-            if param.dtype == torch.float32 or not param.requires_grad:
+            if (parameter_filter is None or parameter_filter(name, param)) and (
+                param.dtype == torch.float32 or not param.requires_grad
+            ):
                 yield f"vp_stages.{vp_stage}.{strip_param_name_prefix(name)}", param
 
 
-def build_main_cast_context(args: Namespace, *, model: Sequence[torch.nn.Module], optimizer) -> MainCastContext:
-    extras = list(_named_restore_extras(model))
+def build_main_cast_context(
+    args: Namespace,
+    *,
+    model: Sequence[torch.nn.Module],
+    optimizer,
+    parameter_filter: _ParameterFilter | None = None,
+) -> MainCastContext:
+    extras = list(_named_restore_extras(model, parameter_filter))
     extras_bytes = sum(t.numel() * t.element_size() for _, t in extras)
     logger.info(
         f"rematerialize-param-from-master-weight: {len(extras)} extra tensors "
@@ -37,8 +50,8 @@ def build_main_cast_context(args: Namespace, *, model: Sequence[torch.nn.Module]
             optimizer, precision_aware=args.use_precision_aware_optimizer
         ),
         model_chunks=model,
-        extras_getter=lambda: _named_restore_extras(model),
-        rematerializable_ids=_assert_rematerialize_coverage(model, extras),
+        extras_getter=lambda: _named_restore_extras(model, parameter_filter),
+        rematerializable_ids=_assert_rematerialize_coverage(model, extras, parameter_filter),
         check=args.check_rematerialize_param_from_master_weight,
     )
 
@@ -79,7 +92,11 @@ def _replay_hybrid_device_copy_back(hdo) -> None:
             shard_view.data.copy_(fp32_master.data)
 
 
-def _assert_rematerialize_coverage(model: Sequence[torch.nn.Module], extras: list[tuple[str, torch.Tensor]]) -> set:
+def _assert_rematerialize_coverage(
+    model: Sequence[torch.nn.Module],
+    extras: list[tuple[str, torch.Tensor]],
+    parameter_filter: _ParameterFilter | None = None,
+) -> set:
     """Anything outside the DDP buffers and the extras backup would come back as garbage.
 
     DDP buffer membership is the right criterion: optimizer structures only cover this
@@ -92,7 +109,7 @@ def _assert_rematerialize_coverage(model: Sequence[torch.nn.Module], extras: lis
     uncovered = []
     for model_module in model:
         for name, param in model_module.named_parameters():
-            if id(param) not in restorable:
+            if (parameter_filter is None or parameter_filter(name, param)) and id(param) not in restorable:
                 uncovered.append(name)
     assert not uncovered, (
         f"--rematerialize-param-from-master-weight cannot restore {len(uncovered)} params "

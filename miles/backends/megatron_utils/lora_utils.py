@@ -190,9 +190,11 @@ def patch_param_grad_buffer_for_colocate_mode_lora() -> None:
     offloads default-region GPU memory.  During LoRA training, base weights are
     frozen (requires_grad=False) so DDP only creates buffers for adapter params.
 
-    This patch ensures those buffers are allocated in the "param_buffer" region
-    (enable_cpu_backup=False), making them invisible to pause(tag="default") —
-    eliminating the need for resume()/pause() around update_weights.
+    This patch allocates those buffers in independent no-backup regions. The
+    shared trainable-parameter lifecycle can therefore drop both buffers at
+    sleep when a pinned TensorBackuper snapshot is the publish/restore source.
+    With rematerialization enabled, it retains the adapter param buffer through
+    the rollout-side ACK and rebuilds it from the optimizer master next cycle.
 
     The patch is idempotent and only takes effect once.
     """

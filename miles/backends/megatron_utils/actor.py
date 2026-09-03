@@ -53,11 +53,12 @@ from .ft.checkpoint_transfer import send_ckpt as _send_ckpt
 from .ft.in_memory_checkpoint import InMemoryCheckpointManager
 from .ft.indep_dp import reconfigure_indep_dp_group
 from .initialize import init, is_first_replica_megatron_main_rank
-from .lora_utils import is_lora_enabled, lora_rollout_enabled
+from .lora_utils import _is_adapter_param_name, is_lora_enabled, lora_rollout_enabled
 from .model import TrainStepOutcome, forward_only, initialize_model_and_optimizer, save, train
-from .named_weights import named_params_and_buffers
+from .named_weights import _maybe_get_cpu_backup, named_params_and_buffers
 from .parallel import verify_megatron_parallel_state
 from .replay_utils import register_replay_list_moe
+from .trainable_param_lifecycle import TrainableParameterLifecycle
 
 if TYPE_CHECKING:
     from miles.ray.rollout.rollout_manager import EnginesAndLock
@@ -80,6 +81,10 @@ def _setup_disk_offload_reclaim(disk_dir: str) -> None:
     os.makedirs(disk_dir, exist_ok=True)
     atexit.register(shutil.rmtree, disk_dir, ignore_errors=True)
     logger.info(f"Train disk-offload reclaim armed for {disk_dir} (startup wipe + atexit)")
+
+
+def _select_adapter_parameter(name: str, _tensor: torch.Tensor) -> bool:
+    return _is_adapter_param_name(name)
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -208,18 +213,27 @@ class MegatronTrainRayActor(TrainRayActor):
 
         start_rollout_id = loaded_rollout_id + 1
         self._asleep = False
+        self._trainable_param_lifecycle = TrainableParameterLifecycle.from_args(args, role)
 
         if role == "critic":
             if self.args.offload_train:
                 self.sleep()
             return start_rollout_id
 
+        backup_adapters_only = (
+            self._weight_sync_reads_tms_backup and self._trainable_param_lifecycle.manages_trainable_parameters
+        )
         main_cast_ctx = None
         if args.rematerialize_param_from_master_weight:
-            main_cast_ctx = build_main_cast_context(args, model=self.model, optimizer=self.optimizer)
+            main_cast_ctx = build_main_cast_context(
+                args,
+                model=self.model,
+                optimizer=self.optimizer,
+                parameter_filter=_select_adapter_parameter if backup_adapters_only else None,
+            )
 
         self.weights_backuper = TensorBackuper.create(
-            source_getter=self._named_actor_weights,
+            source_getter=self._named_adapter_weights if backup_adapters_only else self._named_actor_weights,
             main_cast_ctx=main_cast_ctx,
         )
         self._active_model_tag: str | None = "actor"
@@ -320,13 +334,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         destroy_process_groups()
 
-        if self.args.rematerialize_param_from_master_weight and self.role == "actor":
-            # Params stay resident for update_weights, which pauses them afterwards.
-            torch_memory_saver.pause(tag="grad_buffer")
-            torch_memory_saver.pause(tag="default")
-        else:
-            tag = "default" if lora_rollout_enabled(self.args) else None
-            torch_memory_saver.pause(tag=tag)
+        self._trainable_param_lifecycle.offload_after_train(pause=torch_memory_saver.pause)
 
         self._asleep = True
         print_memory("after offload model")
@@ -344,8 +352,7 @@ class MegatronTrainRayActor(TrainRayActor):
             return
         print_memory("before wake_up model")
 
-        tag = "default" if lora_rollout_enabled(self.args) else None
-        torch_memory_saver.resume(tag=tag)
+        self._trainable_param_lifecycle.onload_before_train(resume=torch_memory_saver.resume)
 
         clear_memory()
         reload_process_groups()
@@ -366,9 +373,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @property
     def _enable_weight_backup(self) -> bool:
-        """Weight backup is only needed for CPU-side model switching or colocated tensor weight sync."""
+        """Back up model-switching weights, or just adapters when TMS owns the frozen base."""
         if self._weight_sync_reads_tms_backup:
-            return False
+            return self._trainable_param_lifecycle.manages_trainable_parameters
         return self.with_ref or self.with_opd_teacher or self.args.keep_old_actor or self.args.colocate
 
     def _switch_model(self, target_tag: str) -> None:
@@ -378,6 +385,8 @@ class MegatronTrainRayActor(TrainRayActor):
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
+        if target_tag == "actor":
+            self._trainable_param_lifecycle.mark_trainable_parameters_restored()
 
     def _set_replay_stage(self, stage: str) -> None:
         for m in all_replay_managers:
@@ -587,6 +596,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 compute_advantages_and_returns(self.args, rollout_data)
                 log_train_advantage_computation_event(rollout_data)
 
+            # Model switching above may already have restored the actor. Otherwise
+            # this is the common FT/LoRA trainable-parameter restore point.
+            self._trainable_param_lifecycle.restore_before_train(lambda: self._switch_model("actor"))
+
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)
 
@@ -764,9 +777,16 @@ class MegatronTrainRayActor(TrainRayActor):
             translate_gpu_to_cpu=translate_gpu_to_cpu,
         )
 
+    def _named_adapter_weights(self):
+        return ((name, tensor) for name, tensor in self._named_actor_weights() if _is_adapter_param_name(name))
+
     def _get_actor_weights(self):
         if self._weight_sync_reads_tms_backup:
-            return dict(self._named_actor_weights(translate_gpu_to_cpu=True))
+            trainable_weights = self.weights_backuper.get("actor") if self._enable_weight_backup else {}
+            return {
+                name: trainable_weights[name] if name in trainable_weights else _maybe_get_cpu_backup(tensor)
+                for name, tensor in self._named_actor_weights()
+            }
         # use cpu backup only when weight is not live on gpu
         if self.args.colocate or self._active_model_tag != "actor":
             return self.weights_backuper.get("actor")
@@ -804,8 +824,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_skip_weight_update:
             if dist.get_rank() == 0:
                 logger.warning("Skipping actor-to-rollout weight update because " "--debug-skip-weight-update is set.")
-            if self.args.rematerialize_param_from_master_weight:
-                torch_memory_saver.pause(tag="param_buffer")
+            self._trainable_param_lifecycle.finish_publish_after_ack(pause=torch_memory_saver.pause)
             if process_groups_are_temporary:
                 destroy_process_groups()
             return
@@ -850,8 +869,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     self.weights_backuper.backup("old_actor")
 
-        if self.args.rematerialize_param_from_master_weight:
-            torch_memory_saver.pause(tag="param_buffer")
+        self._trainable_param_lifecycle.finish_publish_after_ack(pause=torch_memory_saver.pause)
         if process_groups_are_temporary:
             destroy_process_groups()
 

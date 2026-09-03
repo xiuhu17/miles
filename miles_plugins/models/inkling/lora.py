@@ -649,9 +649,16 @@ def _hf_unpadded_vocab_size():
 
 
 _ExportPlan = list[tuple[str, torch.Tensor | Callable[[], torch.Tensor]]]
+_ParameterGetter = Callable[[torch.Tensor], torch.Tensor]
 
 
-def _export_attention(adapter: InklingLoRAAdapter, batch: _GatherBatch) -> _ExportPlan:
+def _get_live_parameter(parameter: torch.Tensor) -> torch.Tensor:
+    return parameter
+
+
+def _export_attention(
+    adapter: InklingLoRAAdapter, batch: _GatherBatch, get_parameter: _ParameterGetter
+) -> _ExportPlan:
     prefix = adapter.hf_prefix
     plans: _ExportPlan = []
     for hf_proj, param_a, param_b in (
@@ -660,57 +667,69 @@ def _export_attention(adapter: InklingLoRAAdapter, batch: _GatherBatch) -> _Expo
         ("wv_dv", adapter.wv_A, adapter.wv_B),
         ("wr_du", adapter.wr_A, adapter.wr_B),
     ):
-        plans.append((f"{prefix}{hf_proj}.lora_A.weight", param_a))
-        plans.append((f"{prefix}{hf_proj}.lora_B.weight", batch.add("tp", param_b, 0).get))
-    plans.append((f"{prefix}wo_ud.lora_A.weight", batch.add("tp", adapter.wo_A, 1).get))
-    plans.append((f"{prefix}wo_ud.lora_B.weight", adapter.wo_B))
+        plans.append((f"{prefix}{hf_proj}.lora_A.weight", get_parameter(param_a)))
+        plans.append((f"{prefix}{hf_proj}.lora_B.weight", batch.add("tp", get_parameter(param_b), 0).get))
+    plans.append((f"{prefix}wo_ud.lora_A.weight", batch.add("tp", get_parameter(adapter.wo_A), 1).get))
+    plans.append((f"{prefix}wo_ud.lora_B.weight", get_parameter(adapter.wo_B)))
     return plans
 
 
-def _export_dense_mlp(adapter: InklingLoRAAdapter, batch: _GatherBatch) -> _ExportPlan:
+def _export_dense_mlp(
+    adapter: InklingLoRAAdapter, batch: _GatherBatch, get_parameter: _ParameterGetter
+) -> _ExportPlan:
     prefix = adapter.hf_prefix
     i_loc = adapter.load_meta["i_loc"]
-    gate_token = batch.add("tp", adapter.fc1_B[:i_loc], 0)
-    up_token = batch.add("tp", adapter.fc1_B[i_loc:], 0)
+    fc1_b = get_parameter(adapter.fc1_B)
+    gate_token = batch.add("tp", fc1_b[:i_loc], 0)
+    up_token = batch.add("tp", fc1_b[i_loc:], 0)
     return [
-        (f"{prefix}gate_up_proj.lora_A.weight", adapter.fc1_A),
+        (f"{prefix}gate_up_proj.lora_A.weight", get_parameter(adapter.fc1_A)),
         (f"{prefix}gate_up_proj.lora_B.weight", lambda: torch.cat([gate_token.get(), up_token.get()], dim=0)),
-        (f"{prefix}down_proj.lora_A.weight", batch.add("tp", adapter.fc2_A, 1).get),
-        (f"{prefix}down_proj.lora_B.weight", adapter.fc2_B),
+        (f"{prefix}down_proj.lora_A.weight", batch.add("tp", get_parameter(adapter.fc2_A), 1).get),
+        (f"{prefix}down_proj.lora_B.weight", get_parameter(adapter.fc2_B)),
     ]
 
 
-def _export_experts(adapter: InklingLoRAAdapter, batch: _GatherBatch) -> _ExportPlan:
+def _export_experts(
+    adapter: InklingLoRAAdapter, batch: _GatherBatch, get_parameter: _ParameterGetter
+) -> _ExportPlan:
     prefix = adapter.hf_prefix
     return [
-        (f"{prefix}w1.lora_A.weight", adapter.w1_A.unsqueeze(0)),
-        (f"{prefix}w3.lora_A.weight", adapter.w3_A.unsqueeze(0)),
-        (f"{prefix}w1.lora_B.weight", batch.add("ep", adapter.w1_B, 0).get),
-        (f"{prefix}w3.lora_B.weight", batch.add("ep", adapter.w3_B, 0).get),
-        (f"{prefix}w2.lora_A.weight", batch.add("ep", adapter.w2_A, 0).get),
-        (f"{prefix}w2.lora_B.weight", adapter.w2_B.unsqueeze(0)),
+        (f"{prefix}w1.lora_A.weight", get_parameter(adapter.w1_A).unsqueeze(0)),
+        (f"{prefix}w3.lora_A.weight", get_parameter(adapter.w3_A).unsqueeze(0)),
+        (f"{prefix}w1.lora_B.weight", batch.add("ep", get_parameter(adapter.w1_B), 0).get),
+        (f"{prefix}w3.lora_B.weight", batch.add("ep", get_parameter(adapter.w3_B), 0).get),
+        (f"{prefix}w2.lora_A.weight", batch.add("ep", get_parameter(adapter.w2_A), 0).get),
+        (f"{prefix}w2.lora_B.weight", get_parameter(adapter.w2_B).unsqueeze(0)),
     ]
 
 
-def _export_shared_experts(adapter: InklingLoRAAdapter, batch: _GatherBatch) -> _ExportPlan:
+def _export_shared_experts(
+    adapter: InklingLoRAAdapter, batch: _GatherBatch, get_parameter: _ParameterGetter
+) -> _ExportPlan:
     prefix = adapter.hf_prefix
     num_shared = adapter.load_meta["ns"]
-    b1_tokens = [batch.add("tp", adapter.w1_B[idx], 0) for idx in range(num_shared)]
-    b3_tokens = [batch.add("tp", adapter.w3_B[idx], 0) for idx in range(num_shared)]
-    a2_tokens = [batch.add("tp", adapter.w2_A[idx], 1) for idx in range(num_shared)]
+    w1_b = get_parameter(adapter.w1_B)
+    w3_b = get_parameter(adapter.w3_B)
+    w2_a = get_parameter(adapter.w2_A)
+    b1_tokens = [batch.add("tp", w1_b[idx], 0) for idx in range(num_shared)]
+    b3_tokens = [batch.add("tp", w3_b[idx], 0) for idx in range(num_shared)]
+    a2_tokens = [batch.add("tp", w2_a[idx], 1) for idx in range(num_shared)]
     return [
-        (f"{prefix}w1.lora_A.weight", adapter.w1_A),
-        (f"{prefix}w3.lora_A.weight", adapter.w3_A),
+        (f"{prefix}w1.lora_A.weight", get_parameter(adapter.w1_A)),
+        (f"{prefix}w3.lora_A.weight", get_parameter(adapter.w3_A)),
         (f"{prefix}w1.lora_B.weight", lambda: torch.cat([token.get() for token in b1_tokens], dim=0)),
         (f"{prefix}w3.lora_B.weight", lambda: torch.cat([token.get() for token in b3_tokens], dim=0)),
         (f"{prefix}w2.lora_A.weight", lambda: torch.cat([token.get() for token in a2_tokens], dim=1)),
-        (f"{prefix}w2.lora_B.weight", adapter.w2_B),
+        (f"{prefix}w2.lora_B.weight", get_parameter(adapter.w2_B)),
     ]
 
 
-def _export_lm_head(adapter: InklingLoRAAdapter, batch: _GatherBatch) -> _ExportPlan:
+def _export_lm_head(
+    adapter: InklingLoRAAdapter, batch: _GatherBatch, get_parameter: _ParameterGetter
+) -> _ExportPlan:
     prefix = adapter.hf_prefix
-    head_b_token = batch.add("tp", adapter.head_B, 0)
+    head_b_token = batch.add("tp", get_parameter(adapter.head_B), 0)
 
     def head_b() -> torch.Tensor:
         full = head_b_token.get()
@@ -720,7 +739,7 @@ def _export_lm_head(adapter: InklingLoRAAdapter, batch: _GatherBatch) -> _Export
         return full
 
     return [
-        (f"{prefix}lora_A.weight", adapter.head_A),
+        (f"{prefix}lora_A.weight", get_parameter(adapter.head_A)),
         (f"{prefix}lora_B.weight", head_b),
     ]
 
@@ -734,13 +753,18 @@ _ADAPTER_EXPORTERS = {
 }
 
 
-def export_inkling_lora_hf_named(model_chunks):
-    """Return (hf_name, full_tensor) for every applied lora param, gathered to full HF layout."""
+def export_inkling_lora_hf_named(model_chunks, *, parameter_getter: _ParameterGetter | None = None):
+    """Return every LoRA tensor in full HF layout.
+
+    ``parameter_getter`` can redirect reads to an external parameter snapshot;
+    without it, export keeps reading the live model.
+    """
     start = time.perf_counter()
     batch = _GatherBatch()
     plans: _ExportPlan = []
+    get_parameter = parameter_getter or _get_live_parameter
     for adapter in _iter_adapters(model_chunks):
-        plans.extend(_ADAPTER_EXPORTERS[adapter.kind](adapter, batch))
+        plans.extend(_ADAPTER_EXPORTERS[adapter.kind](adapter, batch, get_parameter))
 
     n_requests = batch.num_requests()
     n_calls = batch.flush()

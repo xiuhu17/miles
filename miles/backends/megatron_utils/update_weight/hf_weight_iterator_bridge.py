@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 import itertools
 import json
@@ -69,9 +70,9 @@ class HfWeightIteratorBridge(MegatronHfWeightIteratorBase):
                     yield unit
         yield from _iter_mm_tower_units(self.args, materialize=materialize)
 
-    def _export_pp_local_lora(self, adapter):
+    def _export_pp_local_lora(self, adapter, weights):
         if adapter is None:
-            return self._export_current_adapter()
+            return self._export_current_adapter(weights)
 
         from megatron.bridge.peft.multi_lora_layers import expose_adapter_slot
 
@@ -81,9 +82,10 @@ class HfWeightIteratorBridge(MegatronHfWeightIteratorBase):
             named_tensors = self._export_current_adapter()
         return [(h, slice_lora_to_rank(h, w, adapter.config.rank)) for h, w in named_tensors]
 
-    def _export_current_adapter(self) -> list:
+    def _export_current_adapter(self, weights=None) -> list:
         with megatron_bridge_utils.patch_megatron_model(self.model):
-            named_weights = self._bridge.export_adapter_weights(self.model, cpu=False, show_progress=False)
+            renamed_weights = {strip_param_name_prefix(k): v for k, v in (weights or {}).items()}
+            named_weights = _export_adapter_weights_from_local_weights(self._bridge, self.model, renamed_weights)
             named_weights = self._postprocess_and_quantize(named_weights, "lora")
             return [(h, w) for h, w, _m in named_weights if is_lora_weight_name(h)]
 
@@ -119,22 +121,96 @@ def _load_quantized_param_basenames(hf_checkpoint):
 
 
 def _process_conversion_tasks(vanilla_conversion_tasks, new_weight_dict):
-    def _handle_one(task):
-        if task is None:
-            # no HF mapping (e.g. Gemma-4 post_shared_expert_layernorm)
-            return task
-        if task.param_weight is None:
-            return task
+    return _MapWithLen(
+        lambda task: _replace_task_weight(task, new_weight_dict),
+        vanilla_conversion_tasks,
+    )
 
-        weight_dict_key = f"vp_stages.{task.vp_stage}.{task.param_name}"
-        if weight_dict_key not in new_weight_dict:
-            # buffer-like params (Gemma-4 layer_scalar/scale) aren't in optimizer state; keep as-is
-            return task
-        new_param_weight = new_weight_dict[weight_dict_key]
-        new_param_weight = new_param_weight.cuda()
-        return dataclasses.replace(task, param_weight=new_param_weight)
 
-    return _MapWithLen(_handle_one, vanilla_conversion_tasks)
+def _replace_task_weight(task, weights, *, required=False, uploaded=None):
+    if task is None or task.param_weight is None:
+        return task
+
+    key = f"vp_stages.{task.vp_stage}.{task.param_name}"
+    if key not in weights:
+        if required:
+            raise KeyError(
+                f"LoRA publish source is missing adapter tensor {key!r}; "
+                "refusing to fall back to the released live parameter buffer"
+            )
+        # Buffer-like params (Gemma-4 layer_scalar/scale) aren't in optimizer state.
+        return task
+
+    if uploaded is None:
+        weight = weights[key].cuda()
+    else:
+        if key not in uploaded:
+            uploaded[key] = weights[key].cuda(non_blocking=True)
+        weight = uploaded[key]
+    return dataclasses.replace(task, param_weight=weight)
+
+
+def _export_adapter_weights_from_local_weights(bridge, model, new_weight_dict):
+    """Run Bridge's adapter exporter with weights supplied by ``weights_getter``.
+
+    Megatron-Bridge's public adapter exporter always reads ``model`` directly,
+    unlike its base exporter which accepts conversion tasks. For colocated
+    remat-off training, however, the DDP parameter buffer has already been
+    released and ``new_weight_dict`` is the committed pinned snapshot. Replace
+    only the adapter tasks' tensor inputs and retain Bridge's complete fused,
+    TP, PP, and EP conversion implementation.
+
+    An empty mapping is the existing distributed/multi-LoRA contract and keeps
+    using the live-model public API.
+    """
+    if not new_weight_dict:
+        return bridge.export_adapter_weights(model, cpu=False, show_progress=False)
+
+    model_bridge = getattr(bridge, "_model_bridge", None)
+    if (
+        model_bridge is None
+        or not hasattr(model_bridge, "build_adapter_conversion_tasks")
+        or not hasattr(model_bridge, "stream_adapter_weights_megatron_to_hf")
+    ):
+        raise RuntimeError(
+            "The installed Megatron-Bridge cannot export LoRA weights from a supplied snapshot. "
+            "MILES requires build_adapter_conversion_tasks() and "
+            "stream_adapter_weights_megatron_to_hf() for colocated LoRA offload."
+        )
+
+    uploaded_weights = {}
+    adapter_tasks = {
+        base_name: [
+            dataclasses.replace(
+                task,
+                linear_in_task=_replace_task_weight(
+                    task.linear_in_task,
+                    new_weight_dict,
+                    required=True,
+                    uploaded=uploaded_weights,
+                ),
+                linear_out_task=_replace_task_weight(
+                    task.linear_out_task,
+                    new_weight_dict,
+                    required=True,
+                    uploaded=uploaded_weights,
+                ),
+            )
+            for task in tasks
+        ]
+        for base_name, tasks in model_bridge.build_adapter_conversion_tasks(model).items()
+    }
+
+    # Avoid mutating the bridge shared by later base/adapter exports. The pinned
+    # fork's stream implementation asks self.build_adapter_conversion_tasks()
+    # once, then performs all of its normal conversion and collective logic.
+    snapshot_bridge = copy.copy(model_bridge)
+
+    def _get_snapshot_tasks(_model):
+        return adapter_tasks
+
+    snapshot_bridge.build_adapter_conversion_tasks = _get_snapshot_tasks
+    return snapshot_bridge.stream_adapter_weights_megatron_to_hf(model, cpu=False, show_progress=False)
 
 
 class _MapWithLen:

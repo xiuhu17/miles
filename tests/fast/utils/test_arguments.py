@@ -893,6 +893,8 @@ class TestValidateRematerializeParamFromMasterWeight:
             train_backend="megatron",
             lora_rank=0,
             lora_adapter_path=None,
+            lora_train_only=False,
+            multi_lora=False,
             debug_disable_optimizer=False,
             indep_dp=False,
             colocate=True,
@@ -941,6 +943,18 @@ class TestValidateRematerializeParamFromMasterWeight:
         for overrides in ({"use_kl_loss": True}, {"kl_coef": 0.1}, {"opd_teacher_load": "/path/to/teacher"}):
             _validate_rematerialize_param_from_master_weight(self._make_args(**overrides))
 
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"lora_rank": 8},
+            {"lora_adapter_path": "/path/to/adapter"},
+        ],
+    )
+    def test_accepts_single_lora(self, overrides):
+        args = self._make_args(**overrides)
+        _validate_rematerialize_param_from_master_weight(args)
+        assert args.disable_param_buffers_cpu_backup is True
+
     def test_debug_train_only_silently_disables(self):
         args = self._make_args(debug_train_only=True, colocate=False)
         _validate_rematerialize_param_from_master_weight(args)
@@ -956,8 +970,8 @@ class TestValidateRematerializeParamFromMasterWeight:
         "overrides",
         [
             {"train_backend": "fsdp"},
-            {"lora_rank": 8},
-            {"lora_adapter_path": "/path/to/adapter"},
+            {"lora_rank": 8, "multi_lora": True},
+            {"lora_rank": 8, "lora_train_only": True},
             {"debug_disable_optimizer": True},
             {"indep_dp": True},
             {"colocate": False},

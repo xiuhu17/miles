@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from miles.backends.megatron_utils.trainable_param_lifecycle import TrainableParameterLifecycle
 from miles.utils.replay_base import IndexerReplayManager, RoutingReplayManager
 
 
@@ -184,6 +185,7 @@ def test_update_weights_only_uses_temporary_process_groups_when_asleep(actor_mod
         rematerialize_param_from_master_weight=False,
     )
     worker._asleep = asleep
+    worker._trainable_param_lifecycle = Mock()
     worker._heartbeat = Mock()
     worker.weight_updater = Mock()
     worker.weight_updater.is_rollout_engines_fresh.return_value = True
@@ -212,8 +214,18 @@ def _lifecycle_worker(actor_module, monkeypatch, asleep):
         offload_train=True,
         rematerialize_param_from_master_weight=False,
         clear_quantized_weight_workspaces_on_offload=False,
+        colocate=False,
+        debug_train_only=False,
+        use_distributed_optimizer=True,
+        optimizer="adam",
+        lora_rank=0,
+        lora_adapter_path=None,
+        lora_train_only=False,
+        multi_lora=False,
     )
+    worker.role = "actor"
     worker._asleep = asleep
+    worker._trainable_param_lifecycle = TrainableParameterLifecycle.from_args(worker.args, worker.role)
     saver = Mock()
     reload_groups = Mock()
     monkeypatch.setattr(actor_module, "torch_memory_saver", saver)
@@ -222,7 +234,6 @@ def _lifecycle_worker(actor_module, monkeypatch, asleep):
     monkeypatch.setattr(actor_module, "destroy_process_groups", Mock())
     monkeypatch.setattr(actor_module, "reload_process_groups", reload_groups)
     monkeypatch.setattr(actor_module, "is_first_replica_megatron_main_rank", lambda: False)
-    monkeypatch.setattr(actor_module, "is_lora_enabled", lambda _args: False)
     return worker, saver, reload_groups
 
 
@@ -258,6 +269,138 @@ def test_wake_up_resumes_offloaded_model_once(actor_module, monkeypatch):
     assert worker._asleep is False
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rematerialize_param_from_master_weight": True},
+        {"lora_rank": 8, "colocate": True, "rematerialize_param_from_master_weight": True},
+    ],
+)
+def test_live_publish_trainables_share_sleep_and_finish_events(actor_module, monkeypatch, overrides):
+    worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=False)
+    for key, value in overrides.items():
+        setattr(worker.args, key, value)
+    worker._trainable_param_lifecycle = TrainableParameterLifecycle.from_args(worker.args, worker.role)
+
+    worker.sleep()
+
+    assert [call.kwargs for call in saver.pause.call_args_list] == [
+        {"tag": "grad_buffer"},
+        {"tag": "default"},
+    ]
+
+    worker._trainable_param_lifecycle.finish_publish_after_ack(pause=saver.pause)
+
+    assert [call.kwargs["tag"] for call in saver.pause.call_args_list] == [
+        "grad_buffer",
+        "default",
+        "param_buffer",
+    ]
+
+
+def test_single_lora_wake_resumes_default_param_and_grad_regions(actor_module, monkeypatch):
+    worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=True)
+    worker.args.colocate = True
+    worker.args.lora_rank = 8
+    worker._trainable_param_lifecycle = TrainableParameterLifecycle.from_args(worker.args, worker.role)
+
+    worker.wake_up()
+
+    saver.resume.assert_called_once_with(tag=None)
+
+
+def test_multi_lora_keeps_existing_default_only_offload(actor_module, monkeypatch):
+    worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=False)
+    worker.args.colocate = True
+    worker.args.lora_rank = 8
+    worker.args.multi_lora = True
+    worker._trainable_param_lifecycle = TrainableParameterLifecycle.from_args(worker.args, worker.role)
+
+    worker.sleep()
+
+    saver.pause.assert_called_once_with(tag="default")
+
+
+@pytest.mark.parametrize("overrides", [{}, {"lora_rank": 8, "colocate": True}])
+def test_pinned_publish_trainables_drop_all_memory_before_publish(actor_module, monkeypatch, overrides):
+    worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=False)
+    for key, value in overrides.items():
+        setattr(worker.args, key, value)
+    worker._trainable_param_lifecycle = TrainableParameterLifecycle.from_args(worker.args, worker.role)
+
+    worker.sleep()
+    worker._trainable_param_lifecycle.finish_publish_after_ack(pause=saver.pause)
+
+    saver.pause.assert_called_once_with(tag=None)
+
+
+def test_shared_restore_does_not_depend_on_advantage_computation(actor_module, monkeypatch):
+    worker = _actor_reuse_worker(actor_module, compute_advantages_and_returns=False, lora_rank=8)
+    worker._trainable_param_lifecycle.offload_after_train(pause=Mock())
+    worker._trainable_param_lifecycle.finish_publish_after_ack(pause=Mock())
+    _patch_actor_reuse_dependencies(actor_module, monkeypatch, num_microbatches=[1])
+    rollout_data = {"num_rollouts": [1], "total_lengths": [1]}
+
+    worker.train_actor(7, rollout_data, witness_info=None, attempt=0)
+
+    worker._switch_model.assert_called_once_with("actor")
+    actor_module.compute_advantages_and_returns.assert_not_called()
+
+
+@pytest.mark.parametrize("rematerialize", [False, True])
+def test_adapter_backuper_restores_through_shared_model_switch(actor_module, rematerialize):
+    worker = object.__new__(actor_module.MegatronTrainRayActor)
+    worker.args = _actor_train_args(
+        offload_train_target="cpu", lora_rank=8, rematerialize_param_from_master_weight=rematerialize
+    )
+    worker.with_ref = worker.with_opd_teacher = False
+    worker.weights_backuper = Mock(backup_tags=["actor"])
+    worker._active_model_tag = None
+    worker._trainable_param_lifecycle = TrainableParameterLifecycle.from_args(worker.args, "actor")
+    worker._trainable_param_lifecycle.offload_after_train(pause=Mock())
+    worker._trainable_param_lifecycle.finish_publish_after_ack(pause=Mock())
+
+    worker._switch_model("actor")
+    worker._trainable_param_lifecycle.restore_before_train(lambda: worker._switch_model("actor"))
+
+    worker.weights_backuper.restore.assert_called_once_with("actor")
+    assert worker._active_model_tag == "actor"
+
+
+def test_tms_frozen_base_and_pinned_adapter_form_one_publish_mapping(actor_module, monkeypatch):
+    worker = object.__new__(actor_module.MegatronTrainRayActor)
+    worker.args = _actor_train_args(lora_rank=8, offload_train_target="cpu")
+    worker._trainable_param_lifecycle = TrainableParameterLifecycle.from_args(worker.args, "actor")
+    worker.with_ref = False
+    worker.with_opd_teacher = False
+    live_base = object()
+    released_adapter = object()
+    tms_base = object()
+    pinned_adapter = object()
+    worker._named_actor_weights = Mock(
+        return_value=iter(
+            [
+                ("base.weight", live_base),
+                ("layer.lora_adapter.weight", released_adapter),
+            ]
+        )
+    )
+    worker.weights_backuper = Mock()
+    worker.weights_backuper.get.return_value = {
+        "layer.lora_adapter.weight": pinned_adapter,
+    }
+    get_cpu_backup = Mock(return_value=tms_base)
+    monkeypatch.setattr(actor_module, "_maybe_get_cpu_backup", get_cpu_backup)
+
+    weights = worker._get_actor_weights()
+
+    assert weights == {
+        "base.weight": tms_base,
+        "layer.lora_adapter.weight": pinned_adapter,
+    }
+    get_cpu_backup.assert_called_once_with(live_base)
+
+
 def _actor_train_args(**overrides):
     defaults = dict(
         compute_advantages_and_returns=True,
@@ -265,6 +408,15 @@ def _actor_train_args(**overrides):
         keep_old_actor=False,
         get_mismatch_metrics=False,
         skip_actor_forward_only=False,
+        offload_train=True,
+        colocate=True,
+        rematerialize_param_from_master_weight=False,
+        lora_rank=0,
+        lora_adapter_path=None,
+        lora_train_only=False,
+        multi_lora=False,
+        debug_train_only=False,
+        use_distributed_optimizer=True,
     )
     return Namespace(**(defaults | overrides))
 
@@ -277,6 +429,7 @@ def _actor_reuse_worker(actor_module, **args_overrides):
     worker.opt_param_scheduler = object()
     worker.weights_backuper = Mock(backup_tags=set())
     worker._active_model_tag = "actor"
+    worker._trainable_param_lifecycle = TrainableParameterLifecycle.from_args(worker.args, "actor")
     worker._switch_model = Mock()
     worker._set_replay_stage = Mock()
     worker.compute_log_prob = Mock(return_value={"log_probs": [object()]})

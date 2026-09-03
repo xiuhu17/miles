@@ -62,8 +62,8 @@ class _StubIterator(HfWeightIteratorBase):
         for pair in self._base:
             yield [pair]
 
-    def _iter_hf_adapter_units(self, lora_name, adapter, *, materialize):
-        self.export_calls.append(adapter)
+    def _iter_hf_adapter_units(self, weights, lora_name, adapter, *, materialize):
+        self.export_calls.append((weights, adapter))
         for name, tensor in self._exported:
             yield [(f"{lora_name}:{name}", tensor)]
 
@@ -81,8 +81,9 @@ class TestIterHfWeightsTemplate:
     def test_adapter_argument_reaches_the_hook(self):
         iterator = _StubIterator(SAMPLE_LORA_WEIGHTS)
         adapter = SimpleNamespace(slot=3)
-        list(iterator.iter_hf_weights(None, adapters=[("__miles_slot_3", adapter)]))
-        assert iterator.export_calls == [adapter]
+        weights = {"adapter": torch.ones(1)}
+        list(iterator.iter_hf_weights(weights, adapters=[("__miles_slot_3", adapter)]))
+        assert iterator.export_calls == [(weights, adapter)]
 
     def test_include_base_false_streams_adapters_only(self):
         iterator = _StubIterator(SAMPLE_LORA_WEIGHTS, base=SAMPLE_BASE_ONLY_WEIGHTS)

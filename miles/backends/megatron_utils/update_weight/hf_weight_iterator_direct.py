@@ -1,5 +1,5 @@
 from argparse import Namespace
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
@@ -60,15 +60,50 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
         pbar.close()
         yield from _iter_mm_tower_units(self.args, materialize=materialize)
 
-    def _export_pp_local_lora(self, adapter):
+    def _export_pp_local_lora(self, adapter, weights):
         assert adapter is None, "multi-LoRA export requires --megatron-to-hf-mode bridge"
         from miles_plugins.models.inkling.lora import export_inkling_lora_hf_named
 
-        return export_inkling_lora_hf_named(self.model)
+        parameter_getter = _build_lora_parameter_getter(self.args, self.model, weights)
+        return export_inkling_lora_hf_named(self.model, parameter_getter=parameter_getter)
 
     def _convert_to_hf_param_units(self, named_params: Sequence[tuple[str, torch.Tensor]]):
         for name, param in named_params:
             yield list(convert_to_hf(self.args, self.model_name, name, param, self.quantization_config))
+
+
+def _build_lora_parameter_getter(
+    args: Namespace,
+    model: Sequence[torch.nn.Module],
+    weights: Mapping[str, torch.Tensor] | None,
+) -> Callable[[torch.Tensor], torch.Tensor] | None:
+    """Resolve Inkling adapter parameters from a non-empty updater snapshot."""
+    if not weights:
+        return None
+
+    from ..lora_utils import _is_adapter_param_name
+
+    adapter_params = [
+        (name, param) for name, param in named_params_and_buffers(args, model) if _is_adapter_param_name(name)
+    ]
+    missing = [name for name, _param in adapter_params if name not in weights]
+    if missing:
+        raise KeyError(
+            f"LoRA publish source is missing {len(missing)} direct adapter tensor(s), including {missing[0]!r}; "
+            "refusing to fall back to the released live parameter buffer"
+        )
+
+    uploaded = {id(param): weights[name].cuda(non_blocking=True) for name, param in adapter_params}
+
+    def get_parameter(param: torch.Tensor) -> torch.Tensor:
+        try:
+            return uploaded[id(param)]
+        except KeyError as exc:
+            raise KeyError(
+                "Inkling LoRA export requested an adapter parameter absent from the direct snapshot mapping"
+            ) from exc
+
+    return get_parameter
 
 
 def _load_or_allocate_params(param_infos: Sequence[ParamInfo], megatron_local_weights) -> list[torch.Tensor]:

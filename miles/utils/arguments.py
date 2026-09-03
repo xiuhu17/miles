@@ -2846,9 +2846,13 @@ def _validate_rematerialize_param_from_master_weight(args):
     assert (
         args.train_backend == "megatron"
     ), "--rematerialize-param-from-master-weight reads Megatron's distributed-optimizer main params"
-    from miles.backends.megatron_utils.lora_utils import is_lora_enabled
-
-    assert not is_lora_enabled(args), "--rematerialize-param-from-master-weight does not support LoRA"
+    if is_lora_enabled(args):
+        assert not getattr(args, "multi_lora", False), (
+            "--rematerialize-param-from-master-weight only supports a single LoRA adapter"
+        )
+        assert not getattr(args, "lora_train_only", False), (
+            "--rematerialize-param-from-master-weight with LoRA requires rollout-side adapter publish"
+        )
     assert not args.debug_disable_optimizer, "--debug-disable-optimizer leaves no main params to rematerialize from"
     assert not args.indep_dp, (
         "--rematerialize-param-from-master-weight drops the backup inside update_weights, which "

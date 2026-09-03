@@ -90,7 +90,13 @@ class HfWeightIteratorBase(ABC):
         hf_param_units = self._iter_hf_param_units(weights, materialize=materialize) if include_base else iter(())
         for lora_name, adapter in adapters:
             hf_param_units = itertools.chain(
-                hf_param_units, self._iter_hf_adapter_units(lora_name, adapter, materialize=materialize)
+                hf_param_units,
+                self._iter_hf_adapter_units(
+                    weights,
+                    lora_name,
+                    adapter,
+                    materialize=materialize,
+                ),
             )
         atomic_update_groups = self._hf_atomic_update_groups() if include_base and materialize else []
         hf_param_units = assemble_atomic_update_groups(hf_param_units, atomic_update_groups)
@@ -114,7 +120,12 @@ class HfWeightIteratorBase(ABC):
 
     @abstractmethod
     def _iter_hf_adapter_units(
-        self, lora_name: str, adapter, *, materialize: bool
+        self,
+        weights: Mapping[str, torch.Tensor] | None,
+        lora_name: str,
+        adapter,
+        *,
+        materialize: bool,
     ) -> Iterator[list[tuple[str, torch.Tensor]]]:
         """Backend hook: this rank's slice of the adapter per ``self.placement``,
         one unit per parameter, names ``{lora_name}:{hf_key}``, rank-trimmed.
