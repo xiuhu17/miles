@@ -52,7 +52,7 @@ from .ci_utils import (
 )
 from .initialize import is_first_replica_megatron_main_rank
 from .lora_utils import is_lora_enabled, is_lora_model
-from .model_provider import get_model_provider_func
+from .model_provider import configure_lora_primary_weight_storage, get_model_provider_func
 from .parallel import get_packed_seq_params
 from .param_backup_ownership import primary_model_allocation_region
 
@@ -65,6 +65,7 @@ def _has_loadable_ckpt(load_dir: str | None) -> bool:
 
 
 from .bridge_lora_helpers import (  # noqa: F401
+    _assert_row_only_mxfp8_primary_weights_are_frozen,
     _clear_frozen_high_precision_init_values,
     _ensure_model_list,
     _freeze_lora_base_persistent_state,
@@ -150,6 +151,8 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
+    configure_lora_primary_weight_storage(args, role)
+
     with primary_model_allocation_region(args, role):
         # Multi-LoRA and single-LoRA (actor, bridge) both build via the bridge helper,
         # which picks the adapter type internally.
@@ -174,6 +177,8 @@ def setup_model_and_optimizer(
         # high-precision init copy. Clear it for every model-provider path,
         # including non-Bridge custom LoRA providers.
         _freeze_lora_base_persistent_state(model)
+        if args.omit_columnwise_primary_weight_storage:
+            _assert_row_only_mxfp8_primary_weights_are_frozen(model)
         _clear_frozen_high_precision_init_values(model)
 
     if args.debug_disable_optimizer:

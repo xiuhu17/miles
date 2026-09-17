@@ -17,10 +17,26 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
 from miles.utils.audit_utils.witness.module import install_witness
+from miles.utils.lora import is_lora_enabled
 from miles.utils.misc import load_function
 from miles.utils.replay_base import routing_replay_manager
 
 logger = logging.getLogger(__name__)
+
+
+def configure_lora_primary_weight_storage(args: argparse.Namespace, role: str) -> bool:
+    """Enable row-only MXFP8 primary storage only for a frozen actor LoRA base."""
+    omit_columnwise = bool(
+        role == "actor"
+        and is_lora_enabled(args)
+        and getattr(args, "fp8_param_gather", False)
+        and getattr(args, "fp8_recipe", None) == "mxfp8"
+        and getattr(args, "fp8_backward_override", None) is not None
+    )
+    # Native providers pick this field up in core_transformer_config_from_args;
+    # Bridge providers receive it in _apply_bridge_fp8_runtime_config below.
+    args.omit_columnwise_primary_weight_storage = omit_columnwise
+    return omit_columnwise
 
 
 def _apply_bridge_fp8_runtime_config(provider, args: argparse.Namespace) -> None:
@@ -43,7 +59,16 @@ def _apply_bridge_fp8_runtime_config(provider, args: argparse.Namespace) -> None
         return
 
     provider.fp8_param = args.fp8_param_gather
+    if getattr(args, "omit_columnwise_primary_weight_storage", False) and not hasattr(
+        provider, "omit_columnwise_primary_weight_storage"
+    ):
+        raise RuntimeError(
+            "The installed Megatron-Bridge provider does not expose "
+            "omit_columnwise_primary_weight_storage; it cannot build a row-only MXFP8 LoRA base."
+        )
     for field_name in (
+        "fp8_backward_override",
+        "omit_columnwise_primary_weight_storage",
         "fp8_wgrad",
         "fp8_output_proj",
         "tp_only_amax_red",

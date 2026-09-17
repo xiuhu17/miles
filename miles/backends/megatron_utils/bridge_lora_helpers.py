@@ -15,6 +15,7 @@ from megatron.core.utils import get_attr_wrapped_model
 
 from miles.utils.hf_config import load_hf_config
 from miles.utils.multi_lora import is_multi_lora_enabled, targets_expert_leaves
+from miles.utils.native_param_storage import native_format_name
 
 from .lora_utils import convert_target_modules_to_hf, patch_param_grad_buffer_for_colocate_mode_lora
 from .model_provider import _apply_bridge_runtime_config
@@ -107,6 +108,39 @@ def _clear_frozen_high_precision_init_values(model_chunks) -> tuple[int, int]:
             cleared_bytes / 1024**3,
         )
     return cleared_params, cleared_bytes
+
+
+def _assert_row_only_mxfp8_primary_weights_are_frozen(model_chunks) -> int:
+    """Verify the narrow lifecycle contract required by row-only MXFP8 LoRA bases."""
+    quantized_params = []
+    trainable_params = []
+    seen_params: set[int] = set()
+    for model_chunk in _ensure_model_list(model_chunks):
+        for name, param in model_chunk.named_parameters():
+            if id(param) in seen_params:
+                continue
+            seen_params.add(id(param))
+            if not native_format_name(param).startswith("MXFP8"):
+                continue
+            quantized_params.append(name)
+            if param.requires_grad:
+                trainable_params.append(name)
+
+    if not quantized_params:
+        raise RuntimeError(
+            "omit_columnwise_primary_weight_storage was enabled for LoRA, but the model "
+            "contains no MXFP8 primary parameters."
+        )
+    if trainable_params:
+        raise RuntimeError(
+            "Row-only MXFP8 primary storage is restricted to frozen LoRA base weights; "
+            f"trainable quantized parameters: {trainable_params[:20]}"
+        )
+    logger.info(
+        "Validated %d frozen row-only MXFP8 LoRA base parameters",
+        len(quantized_params),
+    )
+    return len(quantized_params)
 
 
 def _freeze_lora_base_persistent_state(model_chunks) -> int:
